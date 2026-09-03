@@ -49,9 +49,15 @@
  * 另修首帧纯绿（NV12 的 UV=0 是最大色偏，转 RGB 恰好是纯绿，应填 128）。
  * 新增多分辨率与分辨率切换回归——旧回归全是 1080p，恰好等于默认几何，
  * 永不触发该分支，这个缺陷因此长期未被发现。详见 CHANGELOG。 */
-#define DMD_DRIVER_VERSION "0.4.3"
+/* 0.4.5（fork）：适配新内核 msm_vidc（Android 12+ / kernel 5.x+）。新内核只接受
+ * V4L2_MEMORY_DMABUF（REQBUFS(USERPTR) 返回 EINVAL）、发标准
+ * V4L2_EVENT_SOURCE_CHANGE、无需 SESSION_CONTINUE。驱动按 REQBUFS 结果
+ * 自动分叉：DMABUF 走新路径（CAPTURE 延迟到事件后协商），老内核（nabu/
+ * kernel 4.14，USERPTR）行为不变。实测 H.264/HEVC 各分辨率与软解 md5
+ * 逐字节一致。详见 CHANGELOG。 */
+#define DMD_DRIVER_VERSION "0.4.5"
 /* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
- * 例：0.4.3+60534cf2 / 0.4.3+60534cf2-dirty。这样 vainfo 能明确报告
+ * 例：0.4.5+60534cf2 / 0.4.5+60534cf2-dirty。这样 vainfo 能明确报告
  * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */
 #ifndef DMD_BUILD_ID
 #define DMD_BUILD_ID "manual"
