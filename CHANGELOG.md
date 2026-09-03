@@ -1,6 +1,6 @@
 # 更新日志
 
-## v0.4.4（未发布）
+## v0.4.4
 
 **新增：适配新内核 msm_vidc（Android 12+ / kernel 5.x+，标准 V4L2 stateful 语义）。**
 
