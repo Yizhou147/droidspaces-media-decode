@@ -292,18 +292,23 @@ static int bufs_alloc(struct dmd_v4l2_dec *d, struct dmd_v4l2_buf *b, int n,
     return 0;
 }
 
-/* msm_vidc 只接受 V4L2_MEMORY_USERPTR，但那是个名义值：
+/* msm_vidc 的缓冲来源一律是 dmabuf fd，差别只在 queue 的内存模式：
+ * 老内核（nabu/4.14）只接受 V4L2_MEMORY_USERPTR，但那是个名义值——
  * 驱动的 vb2_mem_ops.get_userptr 是返回 0xdeadbeef 的桩函数
  * （厂商内核 msm_vidc.c:717-720），真正的缓冲来源是
  *     b->m.planes[i].m.fd = b->m.planes[i].reserved[0];   (msm_vidc.c:533-536)
- * 也就是 dmabuf fd 必须写进 plane.reserved[0]。 */
-static int req_bufs(int fd, enum v4l2_buf_type type, int count)
+ * 也就是 dmabuf fd 必须写进 plane.reserved[0]；
+ * 新内核（Android12+/kernel 5.x+）的 msm_vidc 直接拒绝 USERPTR，
+ * REQBUFS 只接受 V4L2_MEMORY_DMABUF，fd 走 plane.m.fd。
+ * 所以先试 DMABUF，被拒再回退 USERPTR（见 dmd_v4l2_open）。 */
+static int req_bufs(int fd, enum v4l2_buf_type type, int count,
+                    enum v4l2_memory mem)
 {
     struct v4l2_requestbuffers rb;
     memset(&rb, 0, sizeof(rb));
     rb.count = (unsigned)count;
     rb.type = type;
-    rb.memory = V4L2_MEMORY_USERPTR;
+    rb.memory = mem;
     if (xioctl(fd, VIDIOC_REQBUFS, &rb, "REQBUFS") < 0) return -1;
     return (int)rb.count;
 }
@@ -312,23 +317,33 @@ static int req_bufs(int fd, enum v4l2_buf_type type, int count)
  * extra_len 为其长度。CAPTURE 侧设了 EXTRADATA 控制项后 num_planes 为 2。 */
 static int qbuf_userptr(int fd, enum v4l2_buf_type type, int index,
                         struct dmd_v4l2_buf *b, unsigned bytesused,
-                        uint64_t pts_us, int extra_fd, unsigned extra_len)
+                        uint64_t pts_us, int extra_fd, unsigned extra_len,
+                        enum v4l2_memory mem)
 {
     struct v4l2_buffer v;
     struct v4l2_plane p[VIDEO_MAX_PLANES];
+    const int dmabuf = (mem == V4L2_MEMORY_DMABUF);
     memset(&v, 0, sizeof(v));
     memset(p, 0, sizeof(p));
     v.type = type;
-    v.memory = V4L2_MEMORY_USERPTR;
+    v.memory = mem;
     v.index = (unsigned)index;
     v.m.planes = p;
     v.length = (extra_fd >= 0) ? 2 : 1;
-    /* 关键：fd 走 reserved[0]，不是 m.fd 也不是 m.userptr */
-    p[0].reserved[0] = (unsigned)b->dbuf_fd;
+    if (dmabuf) {
+        p[0].m.fd = (int)b->dbuf_fd;
+    } else {
+        /* 老内核：USERPTR 名义值 + fd 走 reserved[0] */
+        p[0].reserved[0] = (unsigned)b->dbuf_fd;
+    }
     p[0].length = (unsigned)b->length;
     p[0].bytesused = bytesused;
     if (extra_fd >= 0) {
-        p[1].reserved[0] = (unsigned)extra_fd;
+        if (dmabuf) {
+            p[1].m.fd = extra_fd;
+        } else {
+            p[1].reserved[0] = (unsigned)extra_fd;
+        }
         p[1].length = extra_len ? extra_len : 16384;
     }
     if (pts_us) {
@@ -530,8 +545,17 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     }
 
     /* OUTPUT 缓冲 + STREAMON。CAPTURE 侧要等 SOURCE_CHANGE 才能配。 */
+    /* 缓冲队列内存模式：新内核 msm_vidc 只接受 DMABUF，老内核只吃
+     * USERPTR 名义值。先 DMABUF，REQBUFS 被拒再回退 USERPTR。 */
+    d->buf_mem = V4L2_MEMORY_DMABUF;
     d->n_out = req_bufs(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-                        DMD_V4L2_MAX_OUT);
+                        DMD_V4L2_MAX_OUT, d->buf_mem);
+    if (d->n_out <= 0) {
+        V4L2_LOG("REQBUFS(DMABUF) 被拒，回退 USERPTR");
+        d->buf_mem = V4L2_MEMORY_USERPTR;
+        d->n_out = req_bufs(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+                            DMD_V4L2_MAX_OUT, d->buf_mem);
+    }
     if (d->n_out <= 0) goto fail;
     if (d->n_out > DMD_V4L2_MAX_OUT) d->n_out = DMD_V4L2_MAX_OUT;
     if (bufs_alloc(d, d->out, d->n_out, d->in_size, 1) < 0) goto fail;
@@ -578,9 +602,16 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
      * SECONDARY 模式下不需要等 SOURCE_CHANGE 才配 CAPTURE ——
      * G_FMT(CAPTURE) 在 session_init 后就能给出正确的 1920x1088，
      * 所以两侧都先配好，再让 STREAMON(OUTPUT) 触发校验。 */
-    if (setup_capture(d) < 0) {
-        V4L2_LOG("CAPTURE 配置失败");
-        goto fail;
+    /* 老内核（USERPTR / SECONDARY 模式）：CAPTURE 在喂料前就能按 OUTPUT
+     * 协商值配好。新内核 msm_vidc 走标准 stateful 语义——发的是标准
+     * V4L2_EVENT_SOURCE_CHANGE，必须等事件后再 G_FMT/S_FMT(CAPTURE) 配缓冲
+     * 并 STREAMON(CAPTURE)；提前配会让固件停在 reconfig 等待态、一帧不吐。
+     * 新内核以 DMABUF 为标志：REQBUFS(DMABUF) 被接受即视为新内核。 */
+    if (d->buf_mem != V4L2_MEMORY_DMABUF) {
+        if (setup_capture(d) < 0) {
+            V4L2_LOG("CAPTURE 配置失败");
+            goto fail;
+        }
     }
 
     if (xioctl(d->fd, VIDIOC_STREAMON, &type, "STREAMON(OUTPUT)") < 0) goto fail;
@@ -771,7 +802,7 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     }
 
     d->n_cap = req_bufs(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-                        DMD_V4L2_MAX_CAP);
+                        DMD_V4L2_MAX_CAP, d->buf_mem);
     if (d->n_cap <= 0) return -1;
     if (d->n_cap > DMD_V4L2_MAX_CAP) d->n_cap = DMD_V4L2_MAX_CAP;
     if (bufs_alloc(d, d->cap, d->n_cap, d->cap_size, 1) < 0) return -1;
@@ -796,7 +827,7 @@ static int setup_capture(struct dmd_v4l2_dec *d)
         if (qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, i,
                         &d->cap[i], 0, 0,
                         d->cap_planes > 1 ? d->extra[i].dbuf_fd : -1,
-                        (unsigned)d->extra_size) < 0)
+                        (unsigned)d->extra_size, d->buf_mem) < 0)
             return -1;
     }
 
@@ -823,7 +854,7 @@ static void reap_output(struct dmd_v4l2_dec *d)
         memset(&v, 0, sizeof(v));
         memset(p, 0, sizeof(p));
         v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        v.memory = V4L2_MEMORY_USERPTR;
+        v.memory = d->buf_mem;
         v.m.planes = p;
         v.length = 1;
         if (ioctl(d->fd, VIDIOC_DQBUF, &v) < 0) break;
@@ -851,7 +882,8 @@ int dmd_v4l2_send(struct dmd_v4l2_dec *d, const uint8_t *data, size_t len,
 
     memcpy(d->out[idx].map, data, len);
     if (qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, idx,
-                    &d->out[idx], (unsigned)len, pts_us, -1, 0) < 0)
+                    &d->out[idx], (unsigned)len, pts_us, -1, 0,
+                    d->buf_mem) < 0)
         return -1;
     return 0;
 }
@@ -868,7 +900,7 @@ static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
     memset(&v, 0, sizeof(v));
     memset(p, 0, sizeof(p));
     v.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    v.memory = V4L2_MEMORY_USERPTR;
+    v.memory = d->buf_mem;
     v.m.planes = p;
     v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
 
@@ -888,7 +920,7 @@ static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
         qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
                      (int)v.index, &d->cap[v.index], 0, 0,
                      d->cap_planes > 1 ? d->extra[v.index].dbuf_fd : -1,
-                     (unsigned)d->extra_size);
+                     (unsigned)d->extra_size, d->buf_mem);
         return 0;
     }
 
@@ -940,8 +972,16 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
         while (guard++ < 8 && ioctl(d->fd, VIDIOC_DQEVENT, &ev) == 0) {
             unsigned rel = ev.type - V4L2_EVENT_MSM_VIDC_START;
 
-            if (ev.type == DMD_EV_MSM_VIDC(2) || ev.type == DMD_EV_MSM_VIDC(3) ||
-                ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+            /* 新内核 msm_vidc（DMABUF 模式）走标准 stateful 语义：发标准
+             * V4L2_EVENT_SOURCE_CHANGE（changes=1 即 RESOLUTION），没有私有
+             * PORT_SETTINGS 事件，也不需要 SESSION_CONTINUE（该私有命令在
+             * 新内核上返回 EINVAL）。配好 CAPTURE 后固件自动继续出帧。 */
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                const unsigned *ed = (const unsigned *)ev.u.data;
+                V4L2_LOG("SOURCE_CHANGE: changes=0x%x", ed[0]);
+                if (!d->cap_ready && setup_capture(d) < 0) return -1;
+            } else if (ev.type == DMD_EV_MSM_VIDC(2) ||
+                       ev.type == DMD_EV_MSM_VIDC(3)) {
                 const unsigned *ed = (const unsigned *)ev.u.data;
                 V4L2_LOG("PORT_SETTINGS%s: h=%u w=%u bitdepth=%u picstruct=%u",
                          ev.type == DMD_EV_MSM_VIDC(3) ? "(INSUFFICIENT)"
@@ -979,7 +1019,7 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                         struct v4l2_requestbuffers rb0;
                         memset(&rb0, 0, sizeof(rb0));
                         rb0.type = ct;
-                        rb0.memory = V4L2_MEMORY_DMABUF;
+                        rb0.memory = d->buf_mem;
                         rb0.count = 0;
                         xioctl(d->fd, VIDIOC_REQBUFS, &rb0, "REQBUFS(CAPTURE,0)");
                         d->cap_ready = 0;
@@ -1003,7 +1043,8 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                  *      分支 (msm_vidc_common.c:4155)
                  * 走 (1) 需要重跑 STREAMON，实测必然触发 SYS_ERROR
                  * （STREAMOFF 把 state 打回 MSM_VIDC_START_DONE 以下）。
-                 * 走 (2) 才是正解：不动队列状态。 */
+                 * 走 (2) 才是正解：不动队列状态。
+                 * （新内核用不到这段：它不发私有 PORT_SETTINGS。） */
                 if (!d->reconfig_done) {
                     struct v4l2_decoder_cmd dc;
                     memset(&dc, 0, sizeof(dc));
@@ -1046,7 +1087,7 @@ int dmd_v4l2_release(struct dmd_v4l2_dec *d, int index)
     return qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, index,
                        &d->cap[index], 0, 0,
                        d->cap_planes > 1 ? d->extra[index].dbuf_fd : -1,
-                       (unsigned)d->extra_size);
+                       (unsigned)d->extra_size, d->buf_mem);
 }
 
 /* ------------------------------------------------------------------ drain */
@@ -1065,7 +1106,7 @@ int dmd_v4l2_drain(struct dmd_v4l2_dec *d)
         for (int i = 0; i < d->n_out; i++) {
             if (!d->out[i].queued) {
                 qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, i,
-                            &d->out[i], 0, 0, -1, 0);
+                            &d->out[i], 0, 0, -1, 0, d->buf_mem);
                 break;
             }
         }

@@ -192,6 +192,7 @@ struct dmd_v4l2_dec {
     int      cap_recfg_tried;                 /* 已试过 CAPTURE 重协商（探测） */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
     int      out_streaming, cap_streaming;
+    int      buf_mem;                         /* 队列内存模式 V4L2_MEMORY_* */
     int      draining;                        /* 已送 EOS，等剩余帧 */
     int      saw_eos;
 };
