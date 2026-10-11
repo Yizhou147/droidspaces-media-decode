@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- 浏览器 codec 能力探测页：把"站点为什么不肯给我 AV1"变成一条能读出来的数。
+     为什么单独有它：站点播放器是先探测、再决定发哪条码流，探测不过就静默回落 H.264，
+     于是出现"解码偏好明明选了 AV1、统计信息里却还是 avc1"。这时候要先把
+     "浏览器答不答应"和"站点给不给"两件事分开，否则一定会去怀疑驱动。
+
+     两件事各自的查法：
+       1) 浏览器答不答应 —— 就是本页。注意**短式与长式要分开测**：
+            av01.0.04M.08                          ← 短式（本仓库其它测试页用的就是这个）
+            av01.0.08M.08.0.110.01.01.01.0         ← 长式（B站 playurl 接口实际下发的写法）
+          本机实测过的是"短式 true、十段式 av01.0.04M.08.0.1.0.0.0 false"；
+          B站那条长式串在本机**没有留下实测值**，谁碰到"选了 AV1 仍播 H.264"就用本页跑一遍再下结论。
+       2) 站点给不给 —— 直接看它自己的码流清单，例如 B站页面控制台里：
+            window.__playinfo__.data.dash.video.map(v=>v.id+' codecid='+v.codecid+' '+v.width+'x'+v.height).join('\n')
+          codecid 7=H.264 / 12=HEVC / 13=AV1。清单里没有 13 就是站点没发，与浏览器无关。
+          （它的接口 fnval=4048 时每一档都同时列 av01/avc1/hev1 三种，播哪条由前端决定。）
+
+     打开：http://127.0.0.1:8777/codec_probe.html      （或直接 file:// 也行，本页不 fetch 文件）
+     判据：结果同时打在页面标题、屏幕正文里，cp_*=canPlayType，ms_*=MediaSource.isTypeSupported，
+           mb_*=ManagedMediaSource.isTypeSupported。
+     另有一条不看日志的硬解在跑判据（站点回落时先用它排除驱动）：
+           for p in $(pgrep -f "/opt/google/chrome/chrome"); do ls -l /proc/$p/fd 2>/dev/null | grep -oE "/dev/video[0-9]+"; done
+           有 /dev/video32（Venus 无状态解码节点，只有 VA-API 驱动会开）就是硬解在跑。 -->
+<meta charset="utf-8">
+<title>probe…</title>
+<pre id="out"></pre>
+<script>
+const LIST = {
+  bili_av1: 'av01.0.08M.08.0.110.01.01.01.0',
+  short_av1: 'av01.0.08M.08',
+  short_av1_720: 'av01.0.05M.08',
+  bili_avc: 'avc1.640032',
+  bili_hev: 'hev1.1.6.L150.90',
+};
+const v = document.createElement('video');
+const R = {};
+for (const [k, c] of Object.entries(LIST)) {
+  const mime = 'video/mp4;codecs="' + c + '"';
+  R['cp_' + k] = v.canPlayType(mime) || '-';
+  try { R['ms_' + k] = MediaSource.isTypeSupported(mime); } catch (e) { R['ms_' + k] = 'E'; }
+  try { R['mb_' + k] = ManagedMediaSource.isTypeSupported(mime); } catch (e) { R['mb_' + k] = 'x'; }
+}
+const out = Object.entries(R).map(([a, b]) => a + '=' + b).join('  ');
+document.getElementById('out').textContent = out + '\nUA=' + navigator.userAgent;
+document.title = out;
+</script>

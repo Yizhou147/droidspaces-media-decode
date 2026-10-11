@@ -42,13 +42,36 @@ google-chrome --ozone-platform=wayland \
 参数：`src` 分段流、`mime` MSE codec 串、`fps` 帧率、`n` 采样数、
 `chunk` 分块字节、`seek=1` 中途插一次 seek。
 
-## 三个测试页
+## 测试页
 
 | 页面 | 覆盖路径 | 关键参数 |
 |------|----------|----------|
 | `mse_test.html` | MSE `appendBuffer` 分段喂流 | `src` `mime` `fps` `n` `chunk` `seek=1` |
 | `net_test.html` | 真实 HTTP 在线源直读 | `url` `fps` `n` `seek=1` |
 | `abr_test.html` | ABR 分辨率切换（换 src） | 页内 `srcs` 数组、`PER` 每档帧数 |
+| `session_churn.html` | 小间隔反复建/拆会话（强度压测） | `n` `gap` `only` `list` |
+| `mse_midgop.html` | GOP 中段进流 + seek + 带内 `changeType()` | `a` `b` `ca` `cb` `n` `gap` `seek=0` `swap=0` |
+| `multistream.html` | 多路并发 + 每轮随机 seek | `k` `n` `gap` `seek=0` `list` |
+| `codec_probe.html` | 浏览器 codec 能力探测（短式/长式分开测） | 无 |
+
+后四个是**稳定性/能力**页，不比对像素，判据在各自文件头的注释里。
+前三个靠 `report.py` 回传，后三个把计数写进 `document.title`，
+用 `--remote-debugging-port` 起浏览器后读 `/json/list` 的 `title` 即可，例：
+
+curl -s http://127.0.0.1:9335/json/list
+
+`session_churn.html?n=1400&gap=400` 就是抓出 v0.4.7 那个
+`close(0)` ×24 真凶的强度（三版本 A/B 数据见该文件头注释与 `CHANGELOG.md`）。
+
+### 不依赖驱动日志判"硬解到底在不在跑"
+
+图标启动的 Chrome 通常没有 `DMD_VA_LOG`，这时看谁占着解码器节点：
+
+for p in $(pgrep -f "/opt/google/chrome/chrome"); do ls -l /proc/$p/fd 2>/dev/null | grep -oE "/dev/video[0-9]+"; done
+
+有 `/dev/video32`（Venus 无状态解码节点，只有 VA-API 驱动会开）= 硬解在跑；
+空了 = 已回落软解。这条在排查"站点选了 AV1 却播 H.264"时先把驱动侧排除掉。
+
 
 ### 实测结果（修复版驱动）
 

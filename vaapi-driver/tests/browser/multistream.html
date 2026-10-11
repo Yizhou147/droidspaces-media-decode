@@ -1,0 +1,78 @@
+<!doctype html>
+<!-- 多路并发解码压测：同时开 K 个 <video>，每轮随机 seek 其中一路。
+     为什么单独有它：单路全绿不代表多路全绿。Venus 是无状态解码器，多路会共用
+     同一套 CAPTURE 缓冲与会话，而 Chrome 侧是一路一个 VAContext。这一页在
+     0.4.7 的验证里跑的是 K=3（480p/720p/1080p 各一路）通过。
+     它同时能压"每路各自拆会话"的组合：K 路 × n 轮 = 建拆会话数远大于单路页。
+
+     素材与起服务方式同 session_churn.html（同一批 av1_*.mp4 直接用）。
+     打开：http://127.0.0.1:8777/multistream.html?k=3&n=40&gap=1500
+     URL 参数：k=路数  n=轮数  gap=每轮毫秒  seek=0 关随机 seek  list=a,b,c 指定素材
+     判据：标题里 stall 与 err 都应为 0、tu 每轮都在涨、几何那一段 K 路尺寸都要报出来
+           （某一路停在 0x0 就是它没建起上下文）；
+           同时看驱动日志的 CreateContext 数是否等于 K×(建会话次数)，
+           以及有没有 exit_code=5 / ENOTTY / "等 IO 所有权超时"。 -->
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;background:#000;overflow:hidden}
+  #grid{display:grid;width:100vw;height:100vh}
+  video{width:100%;height:100%;object-fit:contain;display:block}
+  #hud{position:fixed;left:8px;top:8px;color:#0f0;font:18px monospace;text-shadow:0 0 4px #000;z-index:9}
+</style>
+<div id="grid"></div>
+<div id="hud">?</div>
+<script>
+const qs = new URL(location.href).searchParams;
+let files = ['av1_854x480.mp4', 'av1_1280x720.mp4', 'av1_1920x1080.mp4'];
+if (qs.get('list')) files = qs.get('list').split(',');
+const K    = +(qs.get('k') || 3);
+const GAP  = +(qs.get('gap') || 1500);
+const ROUNDS = +(qs.get('n') || 40);
+const SEEK = qs.get('seek') !== '0';
+
+const grid = document.getElementById('grid');
+grid.style.gridTemplateColumns = `repeat(${Math.ceil(Math.sqrt(K))}, 1fr)`;
+grid.style.gridTemplateRows = `repeat(${Math.ceil(K / Math.ceil(Math.sqrt(K)))}, 1fr)`;
+
+const hud = document.getElementById('hud');
+const vs = [];
+let errs = 0, stalls = 0, round = 0, seeks = 0, loaded = 0;
+
+for (let j = 0; j < K; j++) {
+  const v = document.createElement('video');
+  v.muted = true; v.autoplay = true; v.playsInline = true; v.loop = true;
+  v._last = 0; v._tu = 0;
+  v.addEventListener('error', () => { errs++; });
+  v.addEventListener('timeupdate', () => { v._tu++; });
+  v.addEventListener('loadedmetadata', () => { loaded++; });
+  v.src = files[j % files.length];
+  v.play().catch(() => {});
+  grid.appendChild(v);
+  vs.push(v);
+}
+
+function title(s) { document.title = s; }
+
+function step() {
+  round++;
+  for (const v of vs) {
+    const t = v.currentTime;
+    if (t === v._last && v.readyState >= 2) stalls++;
+    v._last = t;
+  }
+  if (SEEK && vs.length) {
+    const v = vs[round % vs.length];
+    if (v.duration && isFinite(v.duration)) {
+      v.currentTime = (Math.random() * 0.9) * v.duration;
+      seeks++;
+    }
+  }
+  const tu = vs.reduce((a, v) => a + v._tu, 0);
+  const geo = vs.map(v => `${v.videoWidth}x${v.videoHeight}`).join(' ');
+  title(`MS r=${round}/${ROUNDS} k=${K} lm=${loaded} tu=${tu} seek=${seeks} stall=${stalls} err=${errs} ${geo}`);
+  hud.textContent = `并发 ${round}/${ROUNDS} 路数=${K} loadedmetadata=${loaded} timeupdate=${tu} seek=${seeks} 卡住=${stalls} error=${errs}`;
+  if (round < ROUNDS) setTimeout(step, GAP);
+  else title(`MS DONE r=${ROUNDS} lm=${loaded} tu=${tu} seek=${seeks} stall=${stalls} err=${errs}`);
+}
+step();
+</script>

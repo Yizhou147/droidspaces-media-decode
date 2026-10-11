@@ -1,0 +1,157 @@
+<!doctype html>
+<!-- MSE 压测页：分段喂流 + GOP 中段进流 + seek + 带内换分辨率。
+     和同目录 mse_test.html 的分工：那份只做"从关键帧起、顺序 append"的普通路径；
+     这份压的是三条更容易出事的路 ——
+       1) sb.remove() 之后把**前一个非关键帧包**再 append 回去（GOP 中段进流）。
+          驱动侧对应 dmd_av1_refs_resolvable 那条路：引用不出来的帧要按空壳交付
+          （READY + VA_STATUS_SUCCESS），既不能卡 vaSyncSurface，也不能让
+          vaEndPicture 返错 —— 返错会让调用方直接放弃整条码流（修之前实测 rc=251、0 帧）。
+       2) 中途 seek 到已缓冲区的非关键帧位置。
+       3) sb.changeType() 换到另一份不同分辨率的 init 段（带内换分辨率，
+          走的是 V4L2 SOURCE_CHANGE → 重配 CAPTURE 那条，修之前切换后像素错位，
+          变大方向直接 SIGSEGV）。
+
+     素材必须是**分段 mp4**（顶层是 ftyp/moov 之后一串 moof+mdat），生成：
+         ffmpeg -v error -f lavfi -i "testsrc2=size=854x480:rate=25" -t 12 -pix_fmt yuv420p \
+           -c:v libaom-av1 -cpu-used 8 -b:v 600k -g 12 -strict experimental \
+           -movflags frag_keyframe+empty_moov+default_base_moof -y av1_854x480_frag.mp4
+         （720p 同法 → av1_1280x720_frag.mp4）
+     ca/cb 里的 seq_level_idx 要和码流实际等级对上，不然 Chrome 直接判不支持。查实际等级：
+         ffmpeg -i av1_854x480_frag.mp4 -c:v copy -bsf:v trace_headers -f null - 2>&1 | grep -m1 seq_level_idx
+     （480p 通常是 av01.0.04M.08，720p 是 av01.0.05M.08。）
+
+     起服务：python3 -m http.server 8777      # fetch() 在 file:// 下会被拦
+     打开：http://127.0.0.1:8777/mse_midgop.html?n=6&gap=2000
+     URL 参数：a/b=两份分段素材  ca/cb=对应 codec 串  n=轮数  gap=每轮毫秒  seek=0 关 seek  swap=0 关换分辨率
+     判据：标题里 midGOP>0、swap 的后一项（失败次数）为 0、err 为 0、frames 随轮数增长；
+           驱动日志里每次 changeType 之后应看到新一轮 SOURCE_CHANGE 而不是卡住。
+     ⚠️ 别拿驱动里的 DMD_VA_LUMA "黑帧"计数判这份页的画质：Chrome 是在**解码之前**就
+        vaExportSurfaceHandle 导出 surface 的，此刻像素注定全零（实测一次 MSE 压测
+        162 次采样全报黑帧，而帧本身是正常解出来的）。那个计数只对 Firefox 路径有意义。 -->
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;background:#000;overflow:hidden}
+  video{width:100vw;height:100vh;object-fit:contain;display:block}
+  #hud{position:fixed;left:8px;top:8px;color:#0f0;font:18px monospace;text-shadow:0 0 4px #000;z-index:9}
+</style>
+<video id="v" muted autoplay playsinline></video>
+<div id="hud">?</div>
+<script>
+const qs = new URL(location.href).searchParams;
+const A  = qs.get('a') || 'av1_854x480_frag.mp4';
+const B  = qs.get('b') || 'av1_1280x720_frag.mp4';
+const CA = qs.get('ca') || 'av01.0.04M.08';
+const CB = qs.get('cb') || 'av01.0.05M.08';
+const ROUNDS = +(qs.get('n') || 6);
+const GAP    = +(qs.get('gap') || 2000);
+const SEEK   = qs.get('seek') !== '0';
+const SWAP   = qs.get('swap') !== '0';
+
+const v = document.getElementById('v'), hud = document.getElementById('hud');
+let errs = 0, seeks = 0, swaps = 0, swapFail = 0, segs = 0, round = 0;
+let frames = 0, dropped = 0, midGOP = 0;
+
+function title(s) { document.title = s; }
+function say() {
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+  frames = q.totalVideoFrames || 0; dropped = q.droppedVideoFrames || 0;
+  const line = `MSE r=${round}/${ROUNDS} segs=${segs} seek=${seeks} midGOP=${midGOP} swap=${swaps}/${swapFail} frames=${frames} drop=${dropped} err=${errs} rd=${v.readyState} t=${v.currentTime.toFixed(1)}`;
+  title(line); hud.textContent = line;
+}
+v.addEventListener('error', () => { errs++; });
+v.addEventListener('stalled', () => { errs++; });
+
+async function fetchBoxes(name) {
+  const buf = new Uint8Array(await (await fetch(name)).arrayBuffer());
+  let off = 0; const init = [], segs = [];
+  while (off + 8 <= buf.length) {
+    const size = (buf[off] << 24) | (buf[off+1] << 16) | (buf[off+2] << 8) | buf[off+3];
+    const type = String.fromCharCode(buf[off+4], buf[off+5], buf[off+6], buf[off+7]);
+    let n = size;
+    if (size === 1) { /* 64-bit size: not used by ffmpeg empty_moov output */ }
+    if (size === 0) n = buf.length - off;
+    if (n <= 0 || off + n > buf.length) break;
+    const box = buf.subarray(off, off + n);
+    if (type === 'moof' || type === 'mdat') {
+      if (type === 'moof') segs.push([]);
+      if (segs.length) segs[segs.length-1].push(box);
+    } else if (!segs.length) init.push(box);
+    off += n;
+  }
+  const cat = (list) => {
+    const len = list.reduce((a, b) => a + b.length, 0);
+    const out = new Uint8Array(len); let p = 0;
+    for (const l of list) { out.set(l, p); p += l.length; }
+    return out;
+  };
+  return { init: cat(init), segs: segs.map(cat) };
+}
+
+function waitUpdate(sb) {
+  return new Promise(res => {
+    const done = () => { sb.removeEventListener('updateend', done); sb.removeEventListener('error', done); res(); };
+    sb.addEventListener('updateend', done); sb.addEventListener('error', done);
+  });
+}
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+async function oneRound(which) {
+  const data = which === 'b' ? DB : DA;
+  const ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  await new Promise(r => { ms.onsourceopen = r; });
+  const sb = ms.addSourceBuffer(`video/mp4;codecs=${which === 'b' ? CB : CA}`);
+  sb.addEventListener('error', () => { errs++; });
+  sb.appendBuffer(data.init); await waitUpdate(sb);
+  segs++;
+
+  const half = Math.floor(data.segs.length / 2);
+  for (let i = 0; i < data.segs.length; i++) {
+    if (!sb.updating) { sb.appendBuffer(data.segs[i]); segs++; await waitUpdate(sb); }
+    if (i === half) {
+      if (SEEK && v.duration > 1) {
+        midGOP++;
+        sb.remove(0, v.currentTime); await waitUpdate(sb);
+        sb.appendBuffer(data.segs[Math.max(0, i - 1)]); segs++; await waitUpdate(sb);
+        v.currentTime = Math.max(0, v.currentTime - 1.5); seeks++;
+      }
+      if (SWAP && which === 'a') {
+        swaps++;
+        try {
+          sb.changeType(`video/mp4;codecs=${CB}`);
+          sb.appendBuffer(DB.init); await waitUpdate(sb);
+          segs++;
+          sb.appendBuffer(DB.segs[0]); await waitUpdate(sb); segs++;
+        } catch (e) { swapFail++; errs++; }
+      }
+    }
+    if (v.readyState >= 2) v.play().catch(() => {});
+    await wait(GAP / data.segs.length / 2);
+    say();
+  }
+  try { if (sb.updating === false && ms.readyState === 'open' && v.readyState >= 2) ms.endOfStream(); } catch (e) {}
+  await wait(600);
+  v.pause();
+  say();
+  await wait(400);
+}
+
+let DA = null, DB = null;
+async function main() {
+  try {
+    if (!MediaSource.isTypeSupported(`video/mp4;codecs=${CA}`)) { errs += 100; say(); }
+    DA = await fetchBoxes(A);
+    DB = await fetchBoxes(B);
+    if (!DA.segs.length || !DB.segs.length) { errs += 200; say(); return; }
+    for (round = 1; round <= ROUNDS; round++) {
+      await oneRound(round % 2 ? 'a' : 'b');
+      await wait(300);
+    }
+    title(`MSE DONE rounds=${ROUNDS} segs=${segs} seek=${seeks} midGOP=${midGOP} swap=${swaps}/${swapFail} frames=${frames} drop=${dropped} err=${errs}`);
+  } catch (e) {
+    errs += 300;
+    title(`MSE ABORT r=${round} which=${round % 2 ? 'a' : 'b'} CA=${CA} CB=${CB} msg=${String(e && (e.name + ':' + e.message) || e).slice(0, 90)} err=${errs}`);
+  }
+}
+main();
+</script>

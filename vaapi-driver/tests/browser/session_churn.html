@@ -1,0 +1,64 @@
+<!doctype html>
+<!-- 反复"换源 → 建会话 → 拆会话"的压测页。
+     为什么单独有它：v0.4.7 那个 Chrome GPU 进程偶发崩溃（exit_code=5，
+     "Crashing due to FD ownership violation"）只有在**小间隔、大量建拆会话**这个强度下
+     才复现得出来，而它最终定位到的根因是 dmd_v4l2_open() 里 memset 之后
+     extra[].dbuf_fd 停在 0（约定是 -1 表示未分配），于是每拆一次会话
+     无条件 close(0) 24 次。用这个页跑出来的数据：
+         232600f8  约 26 秒崩
+         5b415fc8  约 17 分钟崩 3 次（只修了 io_busy 那一半）
+         d92e4299  548 秒 / CreateContext 1352 / 干净收尾 1351 / 0 崩溃
+
+     起服务（fetch 与 src 都要求 HTTP，file:// 下 MSE 那条会被拦）：
+         python3 -m http.server 8777
+     起浏览器（参数必须齐，缺 --render-node-override 就完全不走硬解；
+     --enable-features 里**不能**有 Vulkan，那一项会让 Chrome 一个解码上下文都不建）：
+         google-chrome --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 \
+           --ignore-gpu-blocklist --use-angle=vulkan \
+           --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL \
+           'http://127.0.0.1:8777/session_churn.html?n=1400&gap=400'
+
+     素材（三份不同分辨率，逼驱动每次都重建会话）：
+         ffmpeg -v error -f lavfi -i "testsrc2=size=854x480:rate=25" -t 12 -pix_fmt yuv420p \
+           -c:v libaom-av1 -cpu-used 8 -b:v 600k -g 12 -strict experimental -y av1_854x480.mp4
+         （1280x720 / 1920x1080 同法，只改 size=）
+
+     URL 参数：n=轮数(默认40)  gap=每次切换毫秒(默认1500)  only=单个文件  list=a,b,c
+     判据：标题里的 sw 应等于 n、tu 持续上涨、err 恒为 0；
+           同时看驱动日志 CreateContext 与"会话结束: 送入 N 单元, 收到 M 帧"数量是否相等，
+           以及 Chrome 侧有没有 exit_code=5。 -->
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;background:#000;overflow:hidden}
+  video{width:100vw;height:100vh;object-fit:contain;display:block}
+  #hud{position:fixed;left:8px;top:8px;color:#0f0;font:22px monospace;text-shadow:0 0 4px #000}
+</style>
+<video id="v" muted autoplay playsinline></video>
+<div id="hud">?</div>
+<script>
+const qs = new URL(location.href).searchParams;
+let files = ['av1_854x480.mp4', 'av1_1280x720.mp4', 'av1_1920x1080.mp4'];
+if (qs.get('only')) files = [qs.get('only')];
+if (qs.get('list')) files = qs.get('list').split(',');
+const TOTAL = +(qs.get('n') || 40);
+const GAP   = +(qs.get('gap') || 1500);
+const v = document.getElementById('v'), hud = document.getElementById('hud');
+let i = 0, tupdates = 0, errs = 0, switches = 0;
+
+v.addEventListener('error', () => { errs++; });
+v.addEventListener('timeupdate', () => { tupdates++; });
+v.addEventListener('loadedmetadata', () => { switches++; });
+
+function title(s) { document.title = s; }
+
+function step() {
+  v.src = files[i % files.length];
+  v.play().catch(() => {});
+  i++;
+  title(`CHURN ${i}/${TOTAL} sw=${switches} tu=${tupdates} err=${errs} ${v.videoWidth}x${v.videoHeight}`);
+  hud.textContent = `切换 ${i}/${TOTAL}  loadedmetadata=${switches}  timeupdate=${tupdates}  error=${errs}  当前=${v.videoWidth}x${v.videoHeight}`;
+  if (i < TOTAL) setTimeout(step, GAP);
+  else setTimeout(() => title(`DONE rounds=${TOTAL} sw=${switches} tu=${tupdates} err=${errs}`), GAP);
+}
+step();
+</script>
