@@ -80,7 +80,7 @@ python3 -m http.server 8777
 | `av1_1280x720_frag.mp4` | 720p 的分段版 | `mse_midgop.html` 的 `b`（带内 `changeType()` 换分辨率的目标） |
 | `av1_hi10_1280x720.mp4` | AV1 **10-bit**，libaom | 10-bit 已知限制的复现 |
 | `av1_hi10_svt_1280x720.mp4` | AV1 10-bit，SVT preset 10（`seq_profile=0 / high_bitdepth=1 / mono_chrome=0 / level 5`） | 同上，换编码器对照 |
-| `av1_probe.mp4` | 像素回归用的探针流 | `tests/regress_av1_pixels.sh` 一类逐帧比对 |
+| `av1_probe.mp4` | AV1 探针流：内容规整、专门用来做逐帧比对 | 页面无引用；留作像素回归素材（`ffmpeg -vsync passthrough` 出 MD5 对比） |
 | `h264_probe.mp4` | H.264 对照探针 | 同上 |
 
 10-bit 那两份是**当前已知限制的复现材料**：解码本身正确，但浏览器拿不到画面
