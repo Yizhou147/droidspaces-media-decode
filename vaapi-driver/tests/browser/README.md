@@ -63,7 +63,37 @@ curl -s http://127.0.0.1:9335/json/list
 `session_churn.html?n=1400&gap=400` 就是抓出 v0.4.7 那个
 `close(0)` ×24 真凶的强度（三版本 A/B 数据见该文件头注释与 `CHANGELOG.md`）。
 
+## 素材
+
+10 份码流就随仓库放在本目录（共 14M；`.gitignore` 里给 `*.mp4` 开了这一条例外）。
+页面用的是相对文件名，所以在**本目录**起服务就能直接跑：
+
+python3 -m http.server 8777
+
+| 文件 | 是什么 | 谁在用 |
+|---|---|---|
+| `av1_854x480.mp4` | AV1 480p，libaom `-cpu-used 8 -b:v 600k -g 12` | `session_churn.html` `multistream.html` |
+| `av1_1280x720.mp4` | AV1 720p，同上 | 同上 |
+| `av1_1920x1080.mp4` | AV1 1080p，同上 | 同上 |
+| `av1_3840x2160.mp4` | AV1 4K，SVT-AV1 preset 12 / 8M / `seq_level_idx` 12 | 4K 强度验证（v0.4.7 已验证项） |
+| `av1_854x480_frag.mp4` | 480p 的**分段**版（`frag_keyframe+empty_moov+default_base_moof`） | `mse_midgop.html` 的 `a` |
+| `av1_1280x720_frag.mp4` | 720p 的分段版 | `mse_midgop.html` 的 `b`（带内 `changeType()` 换分辨率的目标） |
+| `av1_hi10_1280x720.mp4` | AV1 **10-bit**，libaom | 10-bit 已知限制的复现 |
+| `av1_hi10_svt_1280x720.mp4` | AV1 10-bit，SVT preset 10（`seq_profile=0 / high_bitdepth=1 / mono_chrome=0 / level 5`） | 同上，换编码器对照 |
+| `av1_probe.mp4` | 像素回归用的探针流 | `tests/regress_av1_pixels.sh` 一类逐帧比对 |
+| `h264_probe.mp4` | H.264 对照探针 | 同上 |
+
+10-bit 那两份是**当前已知限制的复现材料**：解码本身正确，但浏览器拿不到画面
+（`vaExportSurfaceHandle` 缺 10-bit 的 `SEPARATE_LAYERS` 导出路径，而 Chrome 实测传的就是
+`READ_ONLY \| SEPARATE_LAYERS`）。做 P010 分层导出那一步时要用它们验收。
+
+不想用仓库里这份就自己生成，各压测页文件头注释里有对应的 ffmpeg 命令。
+注意两件事：**MSE 那两个页必须是分段 mp4**，普通 mp4 喂不进 `appendBuffer`；
+`ca`/`cb` 里的 `seq_level_idx` 要和码流实际等级一致，
+用 `ffmpeg -i x.mp4 -c:v copy -bsf:v trace_headers -f null - 2>&1 \| grep -m1 seq_level_idx` 查。
+
 ### 不依赖驱动日志判"硬解到底在不在跑"
+
 
 图标启动的 Chrome 通常没有 `DMD_VA_LOG`，这时看谁占着解码器节点：
 

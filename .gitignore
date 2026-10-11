@@ -47,6 +47,10 @@ Thumbs.db
 *.mp4
 *.mkv
 *.avi
+
+# 例外：浏览器压测页要用的 10 份 AV1/H.264 码流随仓库走，不挂 Release
+# （共 14M，最大一份是 4K 的 6.8M；页面按相对文件名取用，所以直接放在该目录）。
+!vaapi-driver/tests/browser/*.mp4
 # VA-API driver 构建产物
 vaapi-driver/build/
 
