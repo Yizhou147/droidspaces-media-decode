@@ -22,6 +22,7 @@
 #endif
 
 #include "v4l2_backend.h"
+#include "sandbox_heap.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -210,6 +211,13 @@ static uint32_t ion_system_mask(int fd)
 static int heap_open(struct dmd_v4l2_dec *d)
 {
     if (d->heap_fd >= 0) return 0;
+
+    d->heap_fd = dmd_sandbox_system_heap_dup();
+    if (d->heap_fd >= 0) {
+        d->heap_kind = HEAP_DMA_HEAP;
+        V4L2_LOG("缓冲来源: preopened /dev/dma_heap/system");
+        return 0;
+    }
 
     d->heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
     if (d->heap_fd >= 0) {

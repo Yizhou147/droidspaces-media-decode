@@ -1,4 +1,23 @@
-# 更新日志（v0.4.7 · 分支 fix/vaapi-io-fd-race）
+# 更新日志
+
+## v0.5.0-dev
+
+- 新增 Firefox 160 GNU/Linux AArch64 的可选 RDD 兼容库：预开 system heap，
+  对固定 KGSL 描述符增加精确 ioctl 规则，保护其关闭/覆盖并拒绝 exec/io_uring。
+  保留 Mozilla 沙箱与 V4L2 直通；附用户启动入口、策略合并/回滚和内核负向测试。
+
+- 新增容器进程内的 V4L2 编码后端，默认 `/dev/video33`，不引入 daemon、
+  MediaCodec、Socket 或 Mesa 桥接依赖；现有 V4L2 解码保留。
+- 按设备实际格式/profile 探测 H.264 Constrained Baseline/Main/High、HEVC Main、
+  VP9 Profile 0 编码入口。支持 NV12、CBR/VBR、分数帧率、GOP 与强制关键帧。
+- 补齐 VA 编码参数、NV12 PutImage 上传、VACodedBufferSegment 与 SyncBuffer。
+  硬件 IO 在对象表锁外执行；输入与输出快照保护并发销毁，超时/坏包/溢出明确失败。
+- 新增前端、V4L2 模拟后端及完整 VA vtable 合约测试，以及真机编码探针。
+  当前范围和实机验证详见 `doc/hardware-encoding.md`。
+- 容器安装复测中修复既有解码错误路径：拒绝不支持的 HEVC 参数集时归还 IO
+  所有权，明确码流缓冲区所有权，避免后续等待超时及重复释放崩溃。
+
+## v0.4.7
 
 > 以下内容属 **v0.4.7**。它建立在 `v0.4.7-rc1` 之上：rc1 之后又修了两处
 > Chrome 侧的问题（`--enable-features=Vulkan` 的文档错误、以及本文件第一节

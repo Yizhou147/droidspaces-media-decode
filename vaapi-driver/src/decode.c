@@ -36,8 +36,11 @@
 #include "driver.h"
 #include "av1_bitstream.h"
 #include "mpeg2_bitstream.h"
+#include "encode.h"
 
 static void dumb_sync_end_write(struct dmd_surface *s);
+static void encode_output_error_locked(struct dmd_driver *drv,
+                                       struct dmd_context *c, VAStatus status);
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
@@ -103,6 +106,7 @@ struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv, VABufferID id)
 
 void dmd_surface_reset_locked(struct dmd_surface *s)
 {
+    dmd_import_unref(s->imported);
     if (s->exportable) {
         /* 同步用的 dmabuf fd 先关：它对 buffer 持有一份引用，
          * 留着会让 DESTROY_DUMB 之后内存仍不释放。
@@ -128,6 +132,8 @@ void dmd_surface_reset_locked(struct dmd_surface *s)
 
 void dmd_context_reset_locked(struct dmd_context *c)
 {
+    if (c->encoder)
+        dmd_encode_destroy(c->encoder);
     /* session_destroy 会 close socket。它不阻塞（close 不等对端），
      * 所以在这里做是安全的。
      * ⚠️ 它在末尾 memset 整个 context，修复缓冲的释放必须在它**之前**。 */
@@ -211,6 +217,12 @@ static int io_release(struct dmd_driver *drv, int idx)
 {
     drv->io_busy[idx] = 0;
     pthread_cond_broadcast(&drv->io_done);
+
+    if (drv->encode_defer[idx]) {
+        struct dmd_encode *e = drv->encode_defer[idx];
+        drv->encode_defer[idx] = NULL;
+        dmd_encode_destroy(e);
+    }
 
     struct dmd_session *z = drv->io_defer[idx];
     if (!z) return 0;
@@ -577,6 +589,8 @@ static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
     s->id = id;
     s->width = width;
     s->height = height;
+    s->visible_width = width;
+    s->visible_height = height;
     s->buf_width = bw;
     s->buf_height = bh;
     s->stride = stride;
@@ -670,6 +684,51 @@ VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height,
                                   surfaces, (unsigned int)num_surfaces);
 }
 
+static VAStatus create_imported_surfaces(VADriverContextP ctx, unsigned format,
+                                         unsigned width, unsigned height,
+                                         VASurfaceID *surfaces, unsigned count,
+                                         unsigned memory_type, const void *descriptors)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv || !surfaces || !descriptors || !count || count > DMD_MAX_SURFACES)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (format != VA_RT_FORMAT_YUV420)
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    if (width < DMD_MIN_WIDTH || height < DMD_MIN_HEIGHT ||
+        width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT || ((width | height) & 1))
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    /* PRIME v1 has one shared ExternalBuffers descriptor and a buffer array;
+     * only the single-buffer form used by Chromium is supported here. */
+    if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME && count != 1)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    for (unsigned i = 0; i < count; i++) surfaces[i] = VA_INVALID_ID;
+    pthread_mutex_lock(&drv->lock);
+    VAStatus status = VA_STATUS_SUCCESS;
+    unsigned made = 0;
+    for (; made < count; made++) {
+        struct dmd_surface *slot = NULL;
+        for (unsigned i = 0; i < DMD_MAX_SURFACES; i++)
+            if (!drv->surfaces[i].in_use) { slot = &drv->surfaces[i]; break; }
+        if (!slot) { status = VA_STATUS_ERROR_ALLOCATION_FAILED; break; }
+        const void *desc = memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 ?
+            (const VADRMPRIMESurfaceDescriptor *)descriptors + made : descriptors;
+        status = dmd_import_surface_init(slot, width, height, memory_type, desc);
+        if (status != VA_STATUS_SUCCESS) break;
+        slot->in_use = 1;
+        slot->id = drv->next_surface_id++;
+        surfaces[made] = slot->id;
+    }
+    if (status != VA_STATUS_SUCCESS)
+        for (unsigned i = 0; i < made; i++) {
+            dmd_surface_reset_locked(dmd_find_surface_locked(drv, surfaces[i]));
+            surfaces[i] = VA_INVALID_ID;
+        }
+    pthread_mutex_unlock(&drv->lock);
+    dmd_log("CreateSurfaces: imported 0x%x %ux%u n=%u status=0x%x\n",
+            memory_type, width, height, count, status);
+    return status;
+}
+
 VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
                              unsigned int width, unsigned int height,
                              VASurfaceID *surfaces, unsigned int num_surfaces,
@@ -684,6 +743,31 @@ VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
      * 2 字节/样本分配。 */
     if (num_attribs > 0 && !attrib_list)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    const void *external = NULL;
+    int have_memory_type = 0, have_external = 0;
+    for (unsigned i = 0; i < num_attribs; i++) {
+        if (attrib_list[i].type == VASurfaceAttribMemoryType) {
+            if (have_memory_type++ || attrib_list[i].value.type != VAGenericValueTypeInteger)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            memory_type = (unsigned)attrib_list[i].value.value.i;
+        } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
+            if (have_external++ || attrib_list[i].value.type != VAGenericValueTypePointer)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            external = attrib_list[i].value.value.p;
+        }
+    }
+    if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME ||
+        memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        for (unsigned i = 0; i < num_attribs; i++)
+            if (attrib_list[i].type == VASurfaceAttribPixelFormat &&
+                (attrib_list[i].value.type != VAGenericValueTypeInteger ||
+                 attrib_list[i].value.value.i != VA_FOURCC_NV12))
+                return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        return create_imported_surfaces(ctx, format, width, height, surfaces,
+                                         num_surfaces, memory_type, external);
+    }
 
     for (unsigned int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
@@ -954,7 +1038,7 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     }
 
     for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
-        if (!drv->contexts[i].in_use) {
+        if (!drv->contexts[i].in_use && !drv->io_busy[i]) {
             slot_idx = i;
             break;
         }
@@ -971,11 +1055,28 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     c->id = (VAContextID)(drv->next_context_id++);
     c->config_id = config_id;
     c->profile = profile;
+    c->entrypoint = cfg->entrypoint;
     c->codec = codec;
     c->picture_width = (unsigned int)picture_width;
     c->picture_height = (unsigned int)picture_height;
     c->flag = flag;
     c->current_target = VA_INVALID_ID;
+
+    if (cfg->entrypoint == VAEntrypointEncSlice) {
+        unsigned rc = VA_RC_VBR;
+        for (int i = 0; i < cfg->num_attribs; i++)
+            if (cfg->attribs[i].type == VAConfigAttribRateControl)
+                rc = cfg->attribs[i].value;
+        c->encoder = dmd_encode_create(profile, picture_width, picture_height, rc);
+        if (!c->encoder) {
+            dmd_context_reset_locked(c);
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        *context = c->id;
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
 
     VAContextID new_id = c->id;
     pthread_mutex_unlock(&drv->lock);
@@ -1068,6 +1169,13 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
     if (io_stuck)
         dmd_log("DestroyContext: 等 IO 交还超时（%d ms），会话改为延后销毁\n",
                 DMD_FRAME_TIMEOUT_MS);
+
+    /* Encoding works on owned pixel/packet snapshots while the lock is free.
+     * If its bounded IO has not returned yet, the last user owns destruction. */
+    if (c->encoder && io_stuck) {
+        drv->encode_defer[idx] = c->encoder;
+        c->encoder = NULL;
+    }
 
     /* 从此刻起收帧线程不再碰本 context 的会话（它见到 retiring 就跳过）。 */
     c->retiring = 1;
@@ -1236,6 +1344,11 @@ VAStatus dmd_CreateBuffer(VADriverContextP ctx, VAContextID context,
     slot->num_elements = num_elements;
     slot->size = total;
     slot->data = mem;
+    if (type == VAEncCodedBufferType) {
+        slot->coded_segment.buf = mem;
+        slot->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+        slot->coded_status = VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
     *buf_id = slot->id;
     pthread_mutex_unlock(&drv->lock);
@@ -1257,7 +1370,7 @@ VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
-    if (b->mapped) {
+    if (b->mapped || b->coded_pending) {
         /* 映射中改大小会让调用方手上的指针失效。 */
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -1282,6 +1395,12 @@ VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
     if (status == VA_STATUS_SUCCESS) {
         b->num_elements = num_elements;
         b->size = total;
+        if (b->type == VAEncCodedBufferType) {
+            b->coded_segment.buf = b->data;
+            b->coded_segment.size = 0;
+            b->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+            b->coded_status = VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
     pthread_mutex_unlock(&drv->lock);
 
@@ -1300,6 +1419,16 @@ VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
     pthread_mutex_lock(&drv->lock);
     struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
     if (b) {
+        if (b->type == VAEncCodedBufferType) {
+            if (b->coded_pending) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_HW_BUSY;
+            }
+            b->mapped++;
+            *pbuf = &b->coded_segment;
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
         b->mapped++;
         *pbuf = b->data;
         pthread_mutex_unlock(&drv->lock);
@@ -1335,6 +1464,45 @@ VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
  * 这是"填满 vtable"与"libva 靠 NULL 判断能力"之间的一个真实冲突。
  *
  * flags 对我们无意义：后备存储是普通 heap 内存，读写都是直接访问。 */
+VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    /* Match the driver's bounded hardware waits, including VA_TIMEOUT_INFINITE. */
+    const uint64_t limit = (uint64_t)DMD_FRAME_TIMEOUT_MS * 1000000ULL;
+    if (timeout_ns > limit)
+        timeout_ns = limit;
+    deadline.tv_sec += (time_t)(timeout_ns / 1000000000ULL);
+    deadline.tv_nsec += (long)(timeout_ns % 1000000000ULL);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&drv->lock);
+    VAStatus status;
+    for (;;) {
+        struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+        if (!b || b->type != VAEncCodedBufferType) {
+            status = VA_STATUS_ERROR_INVALID_BUFFER;
+            break;
+        }
+        if (!b->coded_pending) {
+            status = b->coded_status;
+            break;
+        }
+        if (timeout_ns == 0 ||
+            pthread_cond_timedwait(&drv->io_done, &drv->lock, &deadline) == ETIMEDOUT) {
+            status = VA_STATUS_ERROR_TIMEDOUT;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+    return status;
+}
+
 VAStatus dmd_MapBuffer2(VADriverContextP ctx, VABufferID buf_id, void **pbuf,
                         uint32_t flags)
 {
@@ -1454,6 +1622,14 @@ static int slice_append_locked(struct dmd_context *c, const void *data,
     return 0;
 }
 
+static int surface_is_external_encode_input(const struct dmd_surface *s)
+{
+    return s->state == DMD_SURFACE_IDLE && s->external_write_exported &&
+           s->exportable && s->dumb_sync_fd >= 0 && !s->imported &&
+           s->decode_status == VA_STATUS_SUCCESS &&
+           s->format == VA_RT_FORMAT_YUV420;
+}
+
 VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
                           VASurfaceID render_target)
 {
@@ -1472,6 +1648,62 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
     if (!s) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    if (c->encoder) {
+        if (drv->io_busy[c - drv->contexts]) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_HW_BUSY;
+        }
+        VAStatus status;
+        if (!surface_is_external_encode_input(s)) {
+            pthread_mutex_unlock(&drv->lock);
+            status = dmd_surface_wait(drv, render_target);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+            pthread_mutex_lock(&drv->lock);
+            c = dmd_find_context_locked(drv, context);
+            s = dmd_find_surface_locked(drv, render_target);
+            if (!c || !c->encoder || !s) {
+                pthread_mutex_unlock(&drv->lock);
+                return !c ? VA_STATUS_ERROR_INVALID_CONTEXT : VA_STATUS_ERROR_INVALID_SURFACE;
+            }
+            if (drv->io_busy[c - drv->contexts]) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_HW_BUSY;
+            }
+            /* Waiting releases the lock: a new submission or failed decode
+             * may have changed the same surface before we reacquired it. */
+            if (s->decode_status != VA_STATUS_SUCCESS) {
+                status = s->decode_status;
+                pthread_mutex_unlock(&drv->lock);
+                return status;
+            }
+            if (s->state != DMD_SURFACE_READY &&
+                !surface_is_external_encode_input(s)) {
+                status = s->state == DMD_SURFACE_PENDING ?
+                    VA_STATUS_ERROR_SURFACE_BUSY : VA_STATUS_ERROR_INVALID_SURFACE;
+                pthread_mutex_unlock(&drv->lock);
+                return status;
+            }
+        }
+        /* WRITE export lets an application supply a fresh NV12 texture without
+         * a decode/PutImage submission. The application finishes GPU commands;
+         * EndPicture still brackets its CPU snapshot with DMA_BUF_SYNC_READ. */
+        if (s->format != VA_RT_FORMAT_YUV420) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        }
+        status = dmd_encode_begin(c->encoder, render_target);
+        if (status == VA_STATUS_SUCCESS)
+            c->current_target = render_target;
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+
+    if (s->imported) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNIMPLEMENTED; /* imported surfaces are read-only inputs */
     }
 
     /* 上一帧没 EndPicture 就又 Begin：丢掉残留数据，否则会拼进新帧。 */
@@ -1525,6 +1757,34 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
     if (c->current_target == VA_INVALID_ID) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT; /* 没 BeginPicture */
+    }
+
+    if (c->encoder) {
+        if (drv->io_busy[c - drv->contexts]) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_HW_BUSY;
+        }
+        VAStatus status = VA_STATUS_SUCCESS;
+        for (int i = 0; i < num_buffers; i++) {
+            struct dmd_buffer *b = dmd_find_buffer_locked(drv, buffers[i]);
+            if (!b || b->context != context) {
+                status = VA_STATUS_ERROR_INVALID_BUFFER;
+                encode_output_error_locked(drv, c, status);
+                dmd_encode_abort(c->encoder);
+                c->current_target = VA_INVALID_ID;
+                break;
+            }
+            status = dmd_encode_render(c->encoder, b->type, b->data,
+                                       b->element_size, b->num_elements);
+            if (status != VA_STATUS_SUCCESS) {
+                dmd_log("Encode RenderPicture: type=%d size=%u status=0x%x\n",
+                        b->type, b->element_size, status);
+                encode_output_error_locked(drv, c, status);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&drv->lock);
+        return status;
     }
 
     VAStatus status = VA_STATUS_SUCCESS;
@@ -2603,6 +2863,138 @@ static int dmd_pending_has_exported_locked(struct dmd_driver *drv,
     return 0;
 }
 
+/* Called with drv->lock held. Encoding may wait for firmware, so it uses owned
+ * snapshots outside the object-table lock. Neither DestroyBuffer nor context
+ * teardown can invalidate memory used by the in-flight ioctl path. */
+static void encode_output_error_locked(struct dmd_driver *drv,
+                                       struct dmd_context *c, VAStatus status)
+{
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv,
+                                 dmd_encode_coded_buffer(c->encoder));
+    if (b && b->context == c->id && b->type == VAEncCodedBufferType &&
+        !b->mapped && !b->coded_pending) {
+        memset(&b->coded_segment, 0, sizeof(b->coded_segment));
+        b->coded_segment.buf = b->data;
+        b->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+        b->coded_status = status;
+    }
+}
+
+static VAStatus encode_abort_locked(struct dmd_driver *drv, struct dmd_context *c,
+                                     VAStatus status)
+{
+    encode_output_error_locked(drv, c, status);
+    dmd_encode_abort(c->encoder);
+    c->current_target = VA_INVALID_ID;
+    return status;
+}
+
+static VAStatus encode_end_locked(struct dmd_driver *drv, struct dmd_context *c)
+{
+    const VAContextID context = c->id;
+    const int idx = (int)(c - drv->contexts);
+    if (drv->io_busy[idx])
+        return VA_STATUS_ERROR_HW_BUSY;
+    struct dmd_surface *source = dmd_find_surface_locked(drv, c->current_target);
+    VABufferID bid = dmd_encode_coded_buffer(c->encoder);
+    struct dmd_buffer *coded = dmd_find_buffer_locked(drv, bid);
+    if (!source)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_INVALID_SURFACE);
+    if (bid == VA_INVALID_ID) {
+        VAStatus status = dmd_encode_end(c->encoder, NULL, NULL);
+        c->current_target = VA_INVALID_ID;
+        return status;
+    }
+    if (!coded || coded->context != context || coded->type != VAEncCodedBufferType)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_INVALID_BUFFER);
+    if (coded->mapped || coded->coded_pending)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_HW_BUSY);
+    if (source->state == DMD_SURFACE_PENDING)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_HW_BUSY);
+
+    struct dmd_surface snapshot = *source;
+    if (source->visible_x || source->visible_y)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_UNIMPLEMENTED);
+    if (source->visible_width)
+        snapshot.width = source->visible_width;
+    if (source->visible_height)
+        snapshot.height = source->visible_height;
+    snapshot.data = malloc(source->data_size);
+    struct dmd_buffer result = *coded;
+    result.data = malloc(coded->size);
+    if (!snapshot.data || !result.data) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_ALLOCATION_FAILED);
+    }
+    const int needs_sync = source->exportable && source->dumb_sync_fd >= 0;
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    if (needs_sync && ioctl(source->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_OPERATION_FAILED);
+    }
+    if (!source->imported)
+        memcpy(snapshot.data, source->data, source->data_size);
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    int sync_error = needs_sync &&
+        ioctl(source->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0;
+    snapshot.exportable = 0;
+    snapshot.dumb_sync_fd = -1;
+    if (sync_error) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_OPERATION_FAILED);
+    }
+    memset(&result.coded_segment, 0, sizeof(result.coded_segment));
+    result.coded_segment.buf = result.data;
+    struct dmd_encode *encoder = c->encoder;
+    c->current_target = VA_INVALID_ID;
+    coded->coded_pending = 1;
+    coded->coded_status = VA_STATUS_ERROR_HW_BUSY;
+    memset(&coded->coded_segment, 0, sizeof(coded->coded_segment));
+    coded->coded_segment.buf = coded->data;
+    drv->io_busy[idx] = 1;
+    dmd_import_ref(snapshot.imported);
+
+    pthread_mutex_unlock(&drv->lock);
+    VAStatus status = snapshot.imported ?
+        dmd_import_copy(&snapshot, snapshot.data, snapshot.data_size) : VA_STATUS_SUCCESS;
+    dmd_import_unref(snapshot.imported);
+    snapshot.imported = NULL;
+    if (status == VA_STATUS_SUCCESS) {
+        status = dmd_encode_end(encoder, &snapshot, &result);
+    } else {
+        dmd_encode_abort(encoder);
+        result.coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+    }
+    free(snapshot.data);
+    pthread_mutex_lock(&drv->lock);
+
+    c = dmd_find_context_locked(drv, context);
+    coded = dmd_find_buffer_locked(drv, bid);
+    if (c && coded && coded->context == context) {
+        if (status == VA_STATUS_SUCCESS && result.coded_segment.size <= coded->size) {
+            memcpy(coded->data, result.data, result.coded_segment.size);
+            coded->coded_segment = result.coded_segment;
+            coded->coded_segment.buf = coded->data;
+            coded->coded_segment.next = NULL;
+        } else {
+            if (status == VA_STATUS_SUCCESS)
+                status = VA_STATUS_ERROR_NOT_ENOUGH_BUFFER;
+            coded->coded_segment.size = 0;
+            coded->coded_segment.status = result.coded_segment.status;
+        }
+        coded->coded_status = status;
+        coded->coded_pending = 0;
+    } else {
+        status = c ? VA_STATUS_ERROR_INVALID_BUFFER : VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    free(result.data);
+    io_release(drv, idx);
+    return status;
+}
+
 VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
@@ -2619,6 +3011,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (c->current_target == VA_INVALID_ID) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    if (c->encoder) {
+        VAStatus status = encode_end_locked(drv, c);
+        pthread_mutex_unlock(&drv->lock);
+        return status;
     }
 
     VASurfaceID target = c->current_target;
@@ -3393,6 +3791,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     /* 拷一份码流到局部缓冲：放锁后 c->slice_data 可能被别的线程复用。 */
     unsigned char *tx = scratch;
+    scratch = NULL; /* 所有权转交 tx；后续退出只能释放 tx，不能再释放同一指针。 */
     if (!tx) {
         tx = malloc(unit_len);
         if (!tx) {
@@ -3415,6 +3814,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * = 下一个拆会话的人以为没人用了。实测签名是 QBUF/DMA_BUF_SYNC 报
      * ENOTTY，Chrome 侧 "Crashing due to FD ownership violation"。 */
     if (io_acquire(drv, idx, "EndPicture/送单元") < 0) {
+        /* 等待期间会放锁：原 context 可能已经销毁，不能改新槽位的队列。 */
+        if (!context_slot_ok(c, context)) {
+            pthread_mutex_unlock(&drv->lock);
+            free(tx);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
         /* 拿不到所有权：这一帧不能送。已登记的队列项要摘回去，
          * 否则留个永远配不上的空洞，其后每帧都落到顺序推断。 */
         if (c->pending_count > 0)
@@ -3427,7 +3832,6 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->current_target = VA_INVALID_ID;
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     if (!context_slot_ok(c, context)) {
@@ -3437,12 +3841,10 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         io_release(drv, idx);
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     sess = c->session;
     if (!sess) {
-        io_release(drv, idx);
         if (c->pending_count > 0)
             c->pending_count--;
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
@@ -3451,9 +3853,10 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
         }
         c->current_target = VA_INVALID_ID;
+        /* 交还可能销毁延后的会话；全部 context/surface 清理须先完成。 */
+        io_release(drv, idx);
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
@@ -3597,15 +4000,21 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             dmd_log("HEVC: 该码流无法合成参数集"
                     "（num_short_term_ref_pic_sets=%u），拒绝\n",
                     c->hevc_pic_param.num_short_term_ref_pic_sets);
-            /* tx 在上面已分配（scratch 为空时 malloc），这条早退路径必须
-             * 释放它 —— 否则每帧泄漏 unit_len 字节。函数正常路径在下面
-             * 统一 free(tx)，走不到这里。
-             *
-             * 注意 tx 可能就是 scratch（所有权已转移给 tx），所以只 free
-             * 一次、不要另外 free(scratch)。 */
-            free(tx);
-            c->pending_count--;
+            if (c->pending_count > 0)
+                c->pending_count--;
+            struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+            if (s) {
+                s->state = DMD_SURFACE_IDLE;
+                s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;
+            }
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            c->av1_tile_count = 0;
+            /* 本函数已经取得 IO 所有权。拒绝也必须交还，否则下一帧
+             * 永远等它；交还可能销毁延后会话，之后不再访问 c/sess。 */
+            io_release(drv, idx);
             pthread_mutex_unlock(&drv->lock);
+            free(tx);
             return VA_STATUS_ERROR_UNIMPLEMENTED;
         }
         if (!c->param_sets_sent || c->sent_mbs_wide != w ||
@@ -4211,6 +4620,20 @@ static void store_clipped_locked(struct dmd_surface *s, const struct dmd_frame *
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
+    s->visible_x = s->visible_y = 0;
+    s->visible_width = s->width;
+    s->visible_height = s->height;
+    if (f->crop_left >= 0 && f->crop_top >= 0 &&
+        f->crop_right >= f->crop_left && f->crop_bottom >= f->crop_top &&
+        (unsigned)f->crop_right < f->width &&
+        (unsigned)f->crop_bottom < f->height) {
+        unsigned w = (unsigned)(f->crop_right - f->crop_left + 1);
+        unsigned h = (unsigned)(f->crop_bottom - f->crop_top + 1);
+        s->visible_x = (unsigned)f->crop_left;
+        s->visible_y = (unsigned)f->crop_top;
+        s->visible_width = w < s->width ? w : s->width;
+        s->visible_height = h < s->height ? h : s->height;
+    }
     /* 诊断：daemon 送来的帧本身是不是黑的？
      * 与 export.c 里的同名探测配对使用，用来区分
      * "解码器就输出了黑帧" 和 "拷进 surface 后才变黑"。

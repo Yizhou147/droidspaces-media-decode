@@ -16,6 +16,43 @@
 #include "dmd_client.h"
 #include "v4l2_backend.h"
 #include "driver.h"
+#include "v4l2_encoder.h"
+
+static int encode_profile_index(VAProfile profile)
+{
+    switch (profile) {
+    case VAProfileH264ConstrainedBaseline: return DMD_ENC_H264_BASELINE;
+    case VAProfileH264Main: return DMD_ENC_H264_MAIN;
+    case VAProfileH264High: return DMD_ENC_H264_HIGH;
+    case VAProfileHEVCMain: return DMD_ENC_HEVC_MAIN;
+    case VAProfileVP9Profile0: return DMD_ENC_VP9_0;
+    default: return -1;
+    }
+}
+
+static int encode_profile_supported(VADriverContextP ctx, VAProfile profile)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    int p = encode_profile_index(profile);
+    return drv && p >= 0 && (drv->encode_caps & DMD_ENC_CAP(p));
+}
+
+static void encode_dimensions(VAProfile profile, unsigned *min_w, unsigned *min_h,
+                               unsigned *max_w, unsigned *max_h)
+{
+    *min_w = DMD_MIN_WIDTH;
+    *min_h = DMD_MIN_HEIGHT;
+    *max_w = DMD_MAX_WIDTH;
+    *max_h = DMD_MAX_HEIGHT;
+    unsigned a, b, c, d;
+    int p = encode_profile_index(profile);
+    if (p >= 0 && dmd_v4l2_enc_get_limits(p, &a, &b, &c, &d) == 0) {
+        if (a > *min_w) *min_w = a;
+        if (b > *min_h) *min_h = b;
+        if (c < *max_w) *max_w = c;
+        if (d < *max_h) *max_h = d;
+    }
+}
 
 /* 本驱动支持的 profile 集合。顺序即 vainfo 的输出顺序。
  *
@@ -243,14 +280,19 @@ VAStatus dmd_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
     if (!ctx || !entrypoint_list || !num_entrypoints)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    if (!dmd_profile_supported(profile)) {
+    int decode = dmd_profile_supported(profile);
+    int encode = encode_profile_supported(ctx, profile);
+    if (!decode && !encode) {
         *num_entrypoints = 0;
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* 只做解码。编码（/dev/video33）是另一个项目，这里不声明。 */
-    entrypoint_list[0] = VAEntrypointVLD;
-    *num_entrypoints = 1;
+    int n = 0;
+    if (decode)
+        entrypoint_list[n++] = VAEntrypointVLD;
+    if (encode)
+        entrypoint_list[n++] = VAEntrypointEncSlice;
+    *num_entrypoints = n;
     return VA_STATUS_SUCCESS;
 }
 
@@ -280,14 +322,37 @@ VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
     if (num_attribs < 0)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    if (!dmd_profile_supported(profile))
+    if (!dmd_profile_supported(profile) && !encode_profile_supported(ctx, profile))
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (entrypoint != VAEntrypointVLD)
+    const int encoding = entrypoint == VAEntrypointEncSlice;
+    if ((encoding && !encode_profile_supported(ctx, profile)) ||
+        (!encoding && (entrypoint != VAEntrypointVLD || !dmd_profile_supported(profile))))
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+
+    unsigned min_w, min_h, max_w = DMD_MAX_WIDTH, max_h = DMD_MAX_HEIGHT;
+    if (encoding)
+        encode_dimensions(profile, &min_w, &min_h, &max_w, &max_h);
 
     /* VA-API 约定：调用方传入想查的 attribute type，driver 填 value；
      * 不支持的项必须填 VA_ATTRIB_NOT_SUPPORTED 而不是报错。 */
     for (int i = 0; i < num_attribs; i++) {
+        if (encoding) {
+            switch (attrib_list[i].type) {
+            case VAConfigAttribRTFormat: attrib_list[i].value = VA_RT_FORMAT_YUV420; break;
+            case VAConfigAttribRateControl: attrib_list[i].value = VA_RC_CBR | VA_RC_VBR; break;
+            case VAConfigAttribEncMaxRefFrames: attrib_list[i].value = 1; break;
+            case VAConfigAttribEncMaxSlices: attrib_list[i].value = 1; break;
+            case VAConfigAttribEncPackedHeaders:
+            case VAConfigAttribEncInterlaced:
+            case VAConfigAttribEncSliceStructure: attrib_list[i].value = 0; break;
+            case VAConfigAttribPredictionDirection:
+                attrib_list[i].value = VA_PREDICTION_DIRECTION_PREVIOUS; break;
+            case VAConfigAttribMaxPictureWidth: attrib_list[i].value = max_w; break;
+            case VAConfigAttribMaxPictureHeight: attrib_list[i].value = max_h; break;
+            default: attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED; break;
+            }
+            continue;
+        }
         switch (attrib_list[i].type) {
         case VAConfigAttribRTFormat:
             /* 8-bit 4:2:0 NV12；AV1 再加一个 10-bit P010。 */
@@ -325,10 +390,41 @@ VAStatus dmd_CreateConfig(VADriverContextP ctx, VAProfile profile,
     if (num_attribs > DMD_MAX_CONFIG_ATTRIBUTES)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    if (!dmd_profile_supported(profile))
+    if (!dmd_profile_supported(profile) && !encode_profile_supported(ctx, profile))
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (entrypoint != VAEntrypointVLD)
+    const int encoding = entrypoint == VAEntrypointEncSlice;
+    if ((encoding && !encode_profile_supported(ctx, profile)) ||
+        (!encoding && (entrypoint != VAEntrypointVLD || !dmd_profile_supported(profile))))
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+
+    if (encoding) {
+        for (int i = 0; i < num_attribs; i++) {
+            uint32_t value = attrib_list[i].value;
+            switch (attrib_list[i].type) {
+            case VAConfigAttribRTFormat:
+                if (value != VA_RT_FORMAT_YUV420)
+                    return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+                break;
+            case VAConfigAttribRateControl:
+                if (value != VA_RC_CBR && value != VA_RC_VBR)
+                    return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncMaxRefFrames:
+                if (value > 1) return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncMaxSlices:
+                if (value != 1) return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncPackedHeaders:
+            case VAConfigAttribEncInterlaced:
+            case VAConfigAttribEncSliceStructure:
+                if (value) return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
+                break;
+            default:
+                return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
+            }
+        }
+    }
 
     VAStatus status = VA_STATUS_ERROR_ALLOCATION_FAILED;
 
@@ -473,9 +569,15 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     pthread_mutex_lock(&drv->lock);
     struct dmd_config *cfg = find_config_locked(drv, config);
     VAProfile cfg_profile = cfg ? cfg->profile : VAProfileNone;
+    int encoding = cfg && cfg->entrypoint == VAEntrypointEncSlice;
     pthread_mutex_unlock(&drv->lock);
     if (!cfg)
         return VA_STATUS_ERROR_INVALID_CONFIG;
+
+    unsigned min_w = DMD_MIN_WIDTH, min_h = DMD_MIN_HEIGHT;
+    unsigned max_w = DMD_MAX_WIDTH, max_h = DMD_MAX_HEIGHT;
+    if (encoding)
+        encode_dimensions(cfg_profile, &min_w, &min_h, &max_w, &max_h);
 
     /* P010 与 NV12 是两个并列的 PixelFormat 属性项（VA-API 允许多个同 type
      * 的项，消费者按 value 匹配自己要的格式）。只给 AV1 多这一项 ——
@@ -484,7 +586,7 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
                          VA_RT_FORMAT_YUV420_10) != 0;
 
     /* VA-API 约定的两段式查询：attrib_list 为 NULL 时只回报数量。 */
-    const unsigned int needed = ten_bit ? 6u : 5u;
+    const unsigned int needed = (ten_bit ? 6u : 5u) + (encoding ? 1u : 0u);
     if (!attrib_list) {
         *num_attribs = needed;
         return VA_STATUS_SUCCESS;
@@ -514,26 +616,35 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     attrib_list[n].type = VASurfaceAttribMinWidth;
     attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[n].value.type = VAGenericValueTypeInteger;
-    attrib_list[n].value.value.i = DMD_MIN_WIDTH;
+    attrib_list[n].value.value.i = min_w;
     n++;
 
     attrib_list[n].type = VASurfaceAttribMinHeight;
     attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[n].value.type = VAGenericValueTypeInteger;
-    attrib_list[n].value.value.i = DMD_MIN_HEIGHT;
+    attrib_list[n].value.value.i = min_h;
     n++;
 
     attrib_list[n].type = VASurfaceAttribMaxWidth;
     attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[n].value.type = VAGenericValueTypeInteger;
-    attrib_list[n].value.value.i = DMD_MAX_WIDTH;
+    attrib_list[n].value.value.i = max_w;
     n++;
 
     attrib_list[n].type = VASurfaceAttribMaxHeight;
     attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[n].value.type = VAGenericValueTypeInteger;
-    attrib_list[n].value.value.i = DMD_MAX_HEIGHT;
+    attrib_list[n].value.value.i = max_h;
     n++;
+
+    if (encoding) {
+        attrib_list[n].type = VASurfaceAttribMemoryType;
+        attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+        attrib_list[n].value.type = VAGenericValueTypeInteger;
+        attrib_list[n].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA |
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+        n++;
+    }
 
     *num_attribs = n;
     return VA_STATUS_SUCCESS;

@@ -24,8 +24,365 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <drm_fourcc.h>
 
 #include "driver.h"
+
+struct dmd_import {
+    atomic_uint refs;
+    unsigned count, width, height;
+    struct { int fd; unsigned char *map; size_t size; } objects[4];
+    struct { unsigned object, offset, pitch; } planes[2];
+};
+
+void dmd_import_ref(struct dmd_import *input)
+{
+    if (input) atomic_fetch_add_explicit(&input->refs, 1, memory_order_relaxed);
+}
+
+void dmd_import_unref(struct dmd_import *input)
+{
+    if (!input || atomic_fetch_sub_explicit(&input->refs, 1, memory_order_acq_rel) != 1)
+        return;
+    for (unsigned i = 0; i < input->count; i++) {
+        if (input->objects[i].map)
+            munmap(input->objects[i].map, input->objects[i].size);
+        if (input->objects[i].fd >= 0)
+            close(input->objects[i].fd);
+    }
+    free(input);
+}
+
+static VAStatus import_validate_size(int fd, unsigned declared_size)
+{
+    /* DMA-BUF guarantees SEEK_END(0)/SEEK_SET(0), but may reject SEEK_CUR
+     * and need not expose its length through stat. A duplicate still shares
+     * the file position, so preserve it when the descriptor supports that. */
+    const off_t previous = lseek(fd, 0, SEEK_CUR);
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size >= 0) {
+        if (lseek(fd, previous >= 0 ? previous : 0, SEEK_SET) < 0)
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+    } else {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        size = st.st_size;
+        /* A failed END must not move the offset; restore a known position
+         * defensively. Old descriptors without llseek can still use stat. */
+        if (previous >= 0 && lseek(fd, previous, SEEK_SET) < 0)
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    return size > 0 && (uint64_t)size >= declared_size ?
+        VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_PARAMETER;
+}
+
+VAStatus dmd_import_surface_init(struct dmd_surface *surface, unsigned width,
+                                  unsigned height, unsigned memory_type,
+                                  const void *descriptor)
+{
+    if (!surface || !descriptor || !width || !height ||
+        width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT || ((width | height) & 1))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    VADRMPRIMESurfaceDescriptor desc = { 0 };
+    if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        memcpy(&desc, descriptor, sizeof(desc));
+    } else if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) {
+        VASurfaceAttribExternalBuffers ext;
+        memcpy(&ext, descriptor, sizeof(ext));
+        if (ext.pixel_format != VA_FOURCC_NV12 || ext.num_planes != 2 ||
+            ext.num_buffers != 1 || !ext.buffers || ext.buffers[0] > INT32_MAX ||
+            ext.flags & ~(VA_SURFACE_EXTBUF_DESC_CACHED |
+                          VA_SURFACE_EXTBUF_DESC_UNCACHED | VA_SURFACE_EXTBUF_DESC_WC) ||
+            ext.private_data)
+            return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        desc.fourcc = ext.pixel_format;
+        desc.width = ext.width;
+        desc.height = ext.height;
+        desc.num_objects = 1;
+        desc.objects[0].fd = (int)ext.buffers[0];
+        desc.objects[0].size = ext.data_size;
+        desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+        desc.num_layers = 1;
+        desc.layers[0].drm_format = DRM_FORMAT_NV12;
+        desc.layers[0].num_planes = 2;
+        for (unsigned p = 0; p < 2; p++) {
+            desc.layers[0].offset[p] = ext.offsets[p];
+            desc.layers[0].pitch[p] = ext.pitches[p];
+        }
+    } else {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    if (desc.fourcc != VA_FOURCC_NV12)
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    if (desc.width != width || desc.height != height ||
+        desc.num_objects < 1 || desc.num_objects > 4)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct dmd_import *input = calloc(1, sizeof(*input));
+    if (!input) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    atomic_init(&input->refs, 1);
+    input->count = desc.num_objects;
+    input->width = width;
+    input->height = height;
+    for (unsigned i = 0; i < input->count; i++) input->objects[i].fd = -1;
+    VAStatus status = VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (desc.num_layers == 1 && desc.layers[0].drm_format == DRM_FORMAT_NV12 &&
+        desc.layers[0].num_planes == 2) {
+        for (unsigned p = 0; p < 2; p++) {
+            input->planes[p].object = desc.layers[0].object_index[p];
+            input->planes[p].offset = desc.layers[0].offset[p];
+            input->planes[p].pitch = desc.layers[0].pitch[p];
+        }
+    } else if (desc.num_layers == 2 && desc.layers[0].num_planes == 1 &&
+               desc.layers[1].num_planes == 1 &&
+               desc.layers[0].drm_format == DRM_FORMAT_R8 &&
+               desc.layers[1].drm_format == DRM_FORMAT_GR88) {
+        for (unsigned p = 0; p < 2; p++) {
+            input->planes[p].object = desc.layers[p].object_index[0];
+            input->planes[p].offset = desc.layers[p].offset[0];
+            input->planes[p].pitch = desc.layers[p].pitch[0];
+        }
+    } else {
+        status = VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        goto fail;
+    }
+    uint64_t ends[2];
+    for (unsigned p = 0; p < 2; p++) {
+        unsigned object = input->planes[p].object;
+        unsigned rows = p ? height / 2 : height;
+        if (object >= input->count || input->planes[p].pitch < width ||
+            (input->planes[p].pitch | input->planes[p].offset) & 1)
+            goto fail;
+        ends[p] = (uint64_t)input->planes[p].offset +
+                  (uint64_t)(rows - 1) * input->planes[p].pitch + width;
+        if (ends[p] > desc.objects[object].size) goto fail;
+    }
+    if (input->planes[0].object == input->planes[1].object &&
+        input->planes[0].offset < ends[1] && input->planes[1].offset < ends[0])
+        goto fail;
+    uint64_t total = 0;
+    for (unsigned i = 0; i < input->count; i++) {
+        if (desc.objects[i].drm_format_modifier != DRM_FORMAT_MOD_LINEAR) {
+            status = VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+            goto fail;
+        }
+        total += desc.objects[i].size;
+        if (desc.objects[i].fd < 0 || !desc.objects[i].size || total > DMD_MAX_FRAME_BYTES)
+            goto fail;
+        input->objects[i].size = desc.objects[i].size;
+        input->objects[i].fd = fcntl(desc.objects[i].fd, F_DUPFD_CLOEXEC, 3);
+        if (input->objects[i].fd < 0) {
+            status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            goto fail;
+        }
+        VAStatus size_status = import_validate_size(input->objects[i].fd,
+                                                     desc.objects[i].size);
+        if (size_status != VA_STATUS_SUCCESS) {
+            status = size_status;
+            goto fail;
+        }
+        void *map = mmap(NULL, input->objects[i].size, PROT_READ, MAP_SHARED,
+                         input->objects[i].fd, 0);
+        if (map == MAP_FAILED) {
+            status = VA_STATUS_ERROR_OPERATION_FAILED;
+            goto fail;
+        }
+        input->objects[i].map = map;
+    }
+    const unsigned stride = dmd_align_up(width, DMD_WIDTH_ALIGN);
+    const unsigned slice = dmd_align_up(height, DMD_HEIGHT_ALIGN);
+    const size_t size = (size_t)stride * slice * 3 / 2;
+    unsigned char *data = calloc(1, size);
+    if (!data) { status = VA_STATUS_ERROR_ALLOCATION_FAILED; goto fail; }
+    memset(data + (size_t)stride * slice, 128, (size_t)stride * slice / 2);
+    memset(surface, 0, sizeof(*surface));
+    surface->width = surface->visible_width = width;
+    surface->height = surface->visible_height = height;
+    surface->buf_width = surface->stride = stride;
+    surface->buf_height = surface->slice_height = slice;
+    surface->format = VA_RT_FORMAT_YUV420;
+    surface->data = data;
+    surface->data_size = size;
+    surface->imported = input;
+    surface->state = DMD_SURFACE_READY;
+    surface->decode_status = VA_STATUS_SUCCESS;
+    surface->context = VA_INVALID_ID;
+    surface->dumb_sync_fd = surface->dumb_drm_fd = -1;
+    return VA_STATUS_SUCCESS;
+fail:
+    dmd_import_unref(input);
+    return status;
+}
+
+/* Caller retains imported storage across this potentially blocking CPU access.
+ * Import FD lifetime and the application FD lifetime are independent. */
+VAStatus dmd_import_copy(const struct dmd_surface *surface, unsigned char *data,
+                          size_t capacity)
+{
+    struct dmd_import *input = surface->imported;
+    if (!input || !data || capacity < surface->data_size)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    unsigned started = 0;
+    VAStatus status = VA_STATUS_SUCCESS;
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    for (; started < input->count; started++)
+        if (ioctl(input->objects[started].fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            status = VA_STATUS_ERROR_OPERATION_FAILED;
+            break;
+        }
+    if (status == VA_STATUS_SUCCESS) {
+        memset(data, 0, (size_t)surface->stride * surface->slice_height);
+        memset(data + (size_t)surface->stride * surface->slice_height, 128,
+                (size_t)surface->stride * surface->slice_height / 2);
+        for (unsigned p = 0; p < 2; p++) {
+            const unsigned char *src = input->objects[input->planes[p].object].map +
+                                        input->planes[p].offset;
+            unsigned char *dst = data + (p ? (size_t)surface->stride * surface->slice_height : 0);
+            for (unsigned y = 0; y < (p ? input->height / 2 : input->height); y++)
+                memcpy(dst + (size_t)y * surface->stride,
+                       src + (size_t)y * input->planes[p].pitch, input->width);
+        }
+    }
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    while (started)
+        if (ioctl(input->objects[--started].fd, DMA_BUF_IOCTL_SYNC, &sync) != 0)
+            status = VA_STATUS_ERROR_OPERATION_FAILED;
+    return status;
+}
+
+/* Upload without scaling or colour conversion. FFmpeg uses this when its
+ * hardware-frame upload cannot map a VA surface directly. */
+VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image,
+                      int src_x, int src_y, unsigned int src_width,
+                      unsigned int src_height, int dest_x, int dest_y,
+                      unsigned int dest_width, unsigned int dest_height)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv || src_x < 0 || src_y < 0 || dest_x < 0 || dest_y < 0 ||
+        !src_width || !src_height)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (src_width != dest_width || src_height != dest_height)
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    if ((src_x | src_y | dest_x | dest_y | src_width | src_height) & 1)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *target = dmd_find_surface_locked(drv, surface);
+    if (!target) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (target->imported) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    }
+    int pending = target->state == DMD_SURFACE_PENDING;
+    pthread_mutex_unlock(&drv->lock);
+    VAStatus status = pending ? dmd_surface_wait(drv, surface) : VA_STATUS_SUCCESS;
+    if (status != VA_STATUS_SUCCESS)
+        return status;
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
+    struct dmd_image *img = dmd_find_image_locked(drv, image);
+    if (!s || !img) {
+        pthread_mutex_unlock(&drv->lock);
+        return !s ? VA_STATUS_ERROR_INVALID_SURFACE : VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+    if (s->state == DMD_SURFACE_PENDING) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_HW_BUSY;
+    }
+    unsigned bpp = s->format == VA_RT_FORMAT_YUV420_10 ? 2 : 1;
+    if (img->image.format.fourcc != (bpp == 2 ? VA_FOURCC_P010 : VA_FOURCC_NV12)) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
+    if ((unsigned)src_x > img->image.width || (unsigned)src_y > img->image.height ||
+        src_width > img->image.width - (unsigned)src_x ||
+        src_height > img->image.height - (unsigned)src_y ||
+        (unsigned)dest_x > s->width || (unsigned)dest_y > s->height ||
+        dest_width > s->width - (unsigned)dest_x ||
+        dest_height > s->height - (unsigned)dest_y) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    size_t row = (size_t)src_width * bpp;
+    size_t bytes = row * src_height * 3 / 2;
+    unsigned char *packed = malloc(bytes);
+    if (!packed) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+    int read_fd = -1;
+    if (img->derived_from != VA_INVALID_ID) {
+        struct dmd_surface *origin = dmd_find_surface_locked(drv, img->derived_from);
+        if (!origin || origin->state == DMD_SURFACE_PENDING) {
+            free(packed);
+            pthread_mutex_unlock(&drv->lock);
+            return origin ? VA_STATUS_ERROR_HW_BUSY : VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        if (origin->exportable)
+            read_fd = origin->dumb_sync_fd;
+    }
+    struct dma_buf_sync read_sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    if (read_fd >= 0 && ioctl(read_fd, DMA_BUF_IOCTL_SYNC, &read_sync) != 0) {
+        free(packed);
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    /* Stage the rectangle so an image derived from this same surface may
+     * overlap the destination without corrupting subsequent source rows. */
+    for (unsigned plane = 0; plane < 2; plane++) {
+        unsigned rows = plane ? src_height / 2 : src_height;
+        unsigned sy = plane ? (unsigned)src_y / 2 : (unsigned)src_y;
+        size_t offset = plane ? row * src_height : 0;
+        for (unsigned y = 0; y < rows; y++)
+            memcpy(packed + offset + y * row,
+                   img->data + img->image.offsets[plane] +
+                   (size_t)(sy + y) * img->image.pitches[plane] + (size_t)src_x * bpp,
+                   row);
+    }
+    read_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    if (read_fd >= 0 && ioctl(read_fd, DMA_BUF_IOCTL_SYNC, &read_sync) != 0) {
+        free(packed);
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    int sync_needed = s->exportable && s->dumb_sync_fd >= 0;
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
+    if (sync_needed && ioctl(s->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        status = VA_STATUS_ERROR_OPERATION_FAILED;
+    } else {
+        for (unsigned plane = 0; plane < 2; plane++) {
+            unsigned rows = plane ? dest_height / 2 : dest_height;
+            unsigned dy = plane ? (unsigned)dest_y / 2 : (unsigned)dest_y;
+            size_t dst_offset = plane ? (size_t)s->stride * s->slice_height : 0;
+            size_t src_offset = plane ? row * src_height : 0;
+            for (unsigned y = 0; y < rows; y++)
+                memcpy(s->data + dst_offset + (size_t)(dy + y) * s->stride +
+                       (size_t)dest_x * bpp, packed + src_offset + y * row, row);
+        }
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+        if (sync_needed && ioctl(s->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0)
+            status = VA_STATUS_ERROR_OPERATION_FAILED;
+        s->state = DMD_SURFACE_READY;
+        s->decode_status = status;
+        s->context = VA_INVALID_ID;
+        s->visible_x = s->visible_y = 0;
+        s->visible_width = s->width;
+        s->visible_height = s->height;
+    }
+    free(packed);
+    pthread_mutex_unlock(&drv->lock);
+    return status;
+}
 
 /* NV12 与 P010 共用同一套几何算式，因为**这里的 stride 一律是字节**：
  * P010 的一行是 样本宽×2 字节，于是 data_size = stride*slice*3/2、
@@ -175,6 +532,13 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
 
     if (!drv || !image)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *imported_source = dmd_find_surface_locked(drv, surface);
+    const int imported = imported_source && imported_source->imported;
+    pthread_mutex_unlock(&drv->lock);
+    if (imported)
+        return VA_STATUS_ERROR_OPERATION_FAILED;
 
     /* 真正的等帧点。SyncSurface 为了不与 MediaCodec 流水线深度死锁，
      * 对"已提交未就绪"的 surface 直接报成功放行（详见 decode.c 里
@@ -337,6 +701,10 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     if (!s) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (s->imported) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
     }
     struct dmd_image *img = dmd_find_image_locked(drv, image);
     if (!img) {

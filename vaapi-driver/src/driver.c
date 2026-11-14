@@ -20,6 +20,8 @@
 #include <string.h>
 
 #include "driver.h"
+#include "encode.h"
+#include "v4l2_encoder.h"
 
 /* 日志开关只读一次。driver 被 dlopen 进宿主进程，
  * 每帧调 getenv 是不必要的开销。 */
@@ -89,6 +91,10 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
             dmd_log("Terminate: 槽位 %d 还挂着延后销毁的会话，直接拆\n", i);
             dmd_session_destroy(drv->io_defer[i]);
             drv->io_defer[i] = NULL;
+        }
+        if (drv->encode_defer[i]) {
+            dmd_encode_destroy(drv->encode_defer[i]);
+            drv->encode_defer[i] = NULL;
         }
     }
     for (int i = 0; i < DMD_MAX_IMAGES; i++) {
@@ -196,6 +202,7 @@ static VAStatus dmd_driver_init(VADriverContextP ctx)
      * 各表用独立的 ID 空间，但 image 的 buf_id 借用 buffer 空间 ——
      * MapBuffer 要能用一个 ID 同时在两张表里查（见 image.c 的说明）。 */
     drv->next_config_id = 1;
+    drv->encode_caps = dmd_v4l2_enc_probe();
     drv->next_surface_id = 1;
     drv->next_context_id = 1;
     drv->next_buffer_id = 1;

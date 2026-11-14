@@ -1,5 +1,23 @@
 # DroidSpaces Media Decode
 
+Version 0.5.0-dev adds **in-process V4L2 hardware encoding** on `/dev/video33`,
+alongside the existing V4L2 decoder. It does not require an Android daemon,
+MediaCodec, Termux or a custom Mesa build. H.264 Constrained Baseline/Main/High,
+HEVC Main and VP9 Profile 0 encoding entrypoints are gated by the selected
+device's actual formats and profiles. Override the node with
+`DMD_VA_ENCODE_DEVICE`.
+
+Encoding accepts progressive 8-bit NV12, CBR/VBR, I/P pictures, one reference
+and one slice. Use `-bf 0` with FFmpeg; recreate the context to change stream
+parameters. HRD/VBV and peak bitrate are hardware rate-control hints.
+See [the encoding guide](doc/hardware-encoding.md) for setup and validation.
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
+  -i input.mp4 -vf format=nv12,hwupload -an \
+  -c:v h264_vaapi -bf 0 -g 30 -rc_mode CBR -b:v 6M output.mp4
+```
+
 > 🌐 **中文版本：[README.md](README.md)**
 
 Hardware video decoding for Linux containers: a VA-API driver that talks directly

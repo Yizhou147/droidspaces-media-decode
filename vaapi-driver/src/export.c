@@ -21,6 +21,7 @@
 #include <fcntl.h> /* O_CLOEXEC —— drm.h 的 DRM_CLOEXEC 是它的别名 */
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <drm/drm.h>
 #include <drm_fourcc.h>
@@ -85,6 +86,8 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     uint32_t handle = s->dumb_handle;
     int drm_fd = s->dumb_drm_fd;
     size_t total = s->dumb_size;
+    const unsigned char *allocation = s->data;
+    unsigned int format = s->format;
     pthread_mutex_unlock(&drv->lock);
 
     /* 10bit 的 SEPARATE_LAYERS 暂不支持，宁可不给也别给错。
@@ -118,9 +121,27 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     /* DRM_CLOEXEC 就是 O_CLOEXEC 的别名（drm.h），用它避免额外包含 fcntl.h。
      * fd 必须 CLOEXEC：驱动跑在浏览器进程里，泄漏到子进程是安全问题。 */
     prime.flags = DRM_CLOEXEC;
+    if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
+        prime.flags |= DRM_RDWR;
     if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
         dmd_log("ExportSurfaceHandle: PRIME_HANDLE_TO_FD 失败\n");
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    /* The ioctl ran without the driver lock. A concurrent destroy/recreate or
+     * geometry change must not publish a descriptor or write permission for a
+     * different allocation. Keep the lock while reading pixels for diagnostics
+     * too: the previous cached surface pointer could otherwise be unmapped. */
+    pthread_mutex_lock(&drv->lock);
+    s = dmd_find_surface_locked(drv, surface_id);
+    if (!s || !s->exportable || s->dumb_handle != handle ||
+        s->dumb_drm_fd != drm_fd || s->dumb_size != total ||
+        s->data != allocation || s->format != format ||
+        s->stride != stride || s->slice_height != slice_h ||
+        s->width != disp_w || s->height != disp_h) {
+        pthread_mutex_unlock(&drv->lock);
+        close(prime.fd);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
     VADRMPRIMESurfaceDescriptor *desc =
@@ -235,11 +256,11 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     /* 标记这个 surface 走的是"导出 dmabuf 自己采样"的契约。
      * EndPicture 据此决定是否必须在返回前把像素同步写进 surface ——
      * 只有这类消费者（Chrome）需要，ffmpeg/Firefox 有 map 兜底。
-     * 重新取指针：上面为了做 ioctl 放过锁。 */
-    pthread_mutex_lock(&drv->lock);
-    s = dmd_find_surface_locked(drv, surface_id);
-    if (s)
-        s->exported = 1;
+     * WRITE export is a separate producer contract (OBS texture input). It
+     * does not change IDLE/PENDING/READY or make undecoded pixels readable. */
+    s->exported = 1;
+    if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
+        s->external_write_exported = 1;
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;
