@@ -151,7 +151,9 @@ int ioctl(int fd, unsigned long request, ...)
     }
     if (request == DMA_BUF_IOCTL_SYNC && fake_sync_mode) {
         struct dma_buf_sync *sync = arg;
-        CHECK(sync && (sync->flags & DMA_BUF_SYNC_READ));
+        CHECK(sync && (fake_sync_mode == 4 ?
+              (sync->flags & DMA_BUF_SYNC_RW) == DMA_BUF_SYNC_WRITE :
+              (sync->flags & DMA_BUF_SYNC_READ) != 0));
         pthread_mutex_lock(&fake_lock);
         if (sync->flags & DMA_BUF_SYNC_END) fake_sync_ends++;
         else fake_sync_starts++;
@@ -1360,6 +1362,162 @@ static int make_exportable_input(struct fixture *f)
     return fd;
 }
 
+/* mpv's format negotiation uploads a real 16x16 image even when it intends to
+ * pass through full-size VA decoder frames. This is an image-storage contract,
+ * not a claim that the video hardware can encode/decode at 16x16. */
+static void test_image_only_surface_dimensions(void)
+{
+    const unsigned invalid[][2] = {
+        { 0, 16 }, { 16, 0 }, { 1, 16 }, { 16, 1 },
+        { 15, 16 }, { 16, 15 }, { 17, 16 }, { 16, 17 },
+        { DMD_MAX_WIDTH + 2, 16 }, { 16, DMD_MAX_HEIGHT + 2 },
+    };
+    for (unsigned ten_bit = 0; ten_bit < 2; ten_bit++) {
+        const unsigned initial_fds = fd_count();
+        struct fixture f;
+        init_driver(&f);
+        const unsigned rt = ten_bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+        VASurfaceAttrib attribute = {
+            .type = VASurfaceAttribPixelFormat,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value.type = VAGenericValueTypeInteger,
+            .value.value.i = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12,
+        };
+        for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            VASurfaceID surface = VA_INVALID_ID;
+            CHECK(f.vt.vaCreateSurfaces2(&f.va, rt, invalid[i][0], invalid[i][1],
+                                          &surface, 1, &attribute, 1) ==
+                  VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+            CHECK(surface == VA_INVALID_ID);
+        }
+        f.width = f.height = 16;
+        OK(f.vt.vaCreateSurfaces2(&f.va, rt, 16, 16, &f.surface, 1, &attribute, 1));
+        int storage = make_exportable_input(&f);
+        fake_export_fd = storage;
+        fake_sync_mode = 4; /* image upload must bracket CPU writes */
+        VAImageFormat format = { .fourcc = (uint32_t)attribute.value.value.i,
+                                 .byte_order = VA_LSB_FIRST };
+        VAImage image;
+        OK(f.vt.vaCreateImage(&f.va, &format, 16, 16, &image));
+        uint8_t *pixels;
+        OK(f.vt.vaMapBuffer(&f.va, image.buf, (void **)&pixels));
+        const unsigned bytes = ten_bit ? 2 : 1;
+        memset(pixels, 0xa5, image.data_size);
+        for (unsigned plane = 0; plane < 2; plane++) {
+            unsigned rows = plane ? 8 : 16;
+            for (unsigned y = 0; y < rows; y++) {
+                for (unsigned x = 0; x < 16; x++) {
+                    uint8_t *sample = pixels + image.offsets[plane] +
+                                       (size_t)y * image.pitches[plane] + x * bytes;
+                    uint8_t value = plane ? uv_sample(x, y) : y_sample(x, y);
+                    sample[0] = ten_bit ? 0 : value;
+                    if (ten_bit) sample[1] = value; /* legal MSB-aligned P010 */
+                }
+            }
+        }
+        OK(f.vt.vaUnmapBuffer(&f.va, image.buf));
+        unsigned starts = fake_sync_starts, ends = fake_sync_ends;
+        OK(f.vt.vaPutImage(&f.va, f.surface, image.image_id, 0, 0, 16, 16,
+                            0, 0, 16, 16));
+        CHECK(fake_sync_starts == starts + 1 && fake_sync_ends == ends + 1);
+        VADRMPRIMESurfaceDescriptor desc;
+        OK(f.vt.vaExportSurfaceHandle(&f.va, f.surface,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc));
+        CHECK(desc.width == 16 && desc.height == 16 && desc.num_layers == 2);
+        CHECK(desc.num_objects == 1 && !(fake_export_flags & DRM_RDWR));
+        CHECK(desc.fourcc == (ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12));
+        CHECK(desc.layers[0].drm_format == (ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8));
+        CHECK(desc.layers[1].drm_format == (ten_bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88));
+        CHECK(fcntl(desc.objects[0].fd, F_GETFD) & FD_CLOEXEC);
+        const uint8_t *external = mmap(NULL, desc.objects[0].size, PROT_READ,
+                                       MAP_SHARED, desc.objects[0].fd, 0);
+        CHECK(external != MAP_FAILED);
+        for (unsigned plane = 0; plane < 2; plane++) {
+            CHECK(desc.layers[plane].num_planes == 1 &&
+                  desc.layers[plane].object_index[0] == 0);
+            CHECK(desc.layers[plane].pitch[0] == 128 * bytes);
+            CHECK(desc.layers[plane].offset[0] == (plane ? 128 * bytes * 32 : 0));
+            unsigned rows = plane ? 8 : 16;
+            for (unsigned y = 0; y < rows; y++) {
+                for (unsigned x = 0; x < 16; x++) {
+                    const uint8_t *sample = external + desc.layers[plane].offset[0] +
+                        (size_t)y * desc.layers[plane].pitch[0] + x * bytes;
+                    uint8_t expected = plane ? uv_sample(x, y) : y_sample(x, y);
+                    CHECK(sample[0] == (ten_bit ? 0 : expected));
+                    if (ten_bit) CHECK(sample[1] == expected);
+                }
+            }
+        }
+        CHECK(munmap((void *)external, desc.objects[0].size) == 0);
+        CHECK(close(desc.objects[0].fd) == 0);
+        OK(f.vt.vaDestroyImage(&f.va, image.image_id));
+        OK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1));
+        fake_sync_mode = 0;
+        fake_export_fd = -1;
+        CHECK(close(storage) == 0);
+        finish_driver(&f);
+        CHECK(fd_count() == initial_fds);
+    }
+}
+
+static void test_codec_context_minimums(void)
+{
+    static const struct {
+        VAProfile profile;
+        VAEntrypoint entrypoint;
+        unsigned rt;
+    } configs[] = {
+        { VAProfileH264Main, VAEntrypointVLD, VA_RT_FORMAT_YUV420 },
+        { VAProfileHEVCMain, VAEntrypointVLD, VA_RT_FORMAT_YUV420 },
+        { VAProfileH264Main, VAEntrypointEncSlice, VA_RT_FORMAT_YUV420 },
+#ifdef DMD_ENABLE_HEVC_MAIN10
+        { VAProfileHEVCMain10, VAEntrypointVLD, VA_RT_FORMAT_YUV420_10 },
+#endif
+    };
+    static const unsigned small[][2] = {
+        { 16, 16 }, { 16, 96 }, { 96, 16 }, { 94, 96 }, { 96, 94 },
+    };
+    for (unsigned n = 0; n < sizeof(configs) / sizeof(configs[0]); n++) {
+        struct fixture f;
+        init_driver(&f);
+        VAConfigAttrib attribute = { VAConfigAttribRTFormat, configs[n].rt };
+        OK(f.vt.vaCreateConfig(&f.va, configs[n].profile, configs[n].entrypoint,
+                               &attribute, 1, &f.config));
+        OK(f.vt.vaCreateSurfaces2(&f.va, configs[n].rt, 16, 16,
+                                  &f.surface, 1, NULL, 0));
+        VASurfaceAttrib attributes[8];
+        unsigned count = sizeof(attributes) / sizeof(attributes[0]);
+        OK(f.vt.vaQuerySurfaceAttributes(&f.va, f.config, attributes, &count));
+        unsigned minimums = 0;
+        for (unsigned a = 0; a < count; a++) {
+            if (attributes[a].type == VASurfaceAttribMinWidth) {
+                CHECK(attributes[a].value.value.i == DMD_MIN_WIDTH);
+                minimums++;
+            }
+            if (attributes[a].type == VASurfaceAttribMinHeight) {
+                CHECK(attributes[a].value.value.i == DMD_MIN_HEIGHT);
+                minimums++;
+            }
+        }
+        CHECK(minimums == 2);
+        unsigned opened = fake_open_calls;
+        for (unsigned s = 0; s < sizeof(small) / sizeof(small[0]); s++) {
+            VAContextID context = VA_INVALID_ID;
+            CHECK(f.vt.vaCreateContext(&f.va, f.config, small[s][0], small[s][1],
+                                        VA_PROGRESSIVE, &f.surface, 1, &context) ==
+                  VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+            CHECK(context == VA_INVALID_ID && fake_open_calls == opened);
+        }
+        struct dmd_driver *driver = dmd_get_driver(&f.va);
+        for (unsigned c = 0; c < DMD_MAX_CONTEXTS; c++)
+            CHECK(!driver->contexts[c].in_use);
+        OK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1));
+        OK(f.vt.vaDestroyConfig(&f.va, f.config));
+        finish_driver(&f);
+    }
+}
+
 static void test_write_export_encoder_input(void)
 {
     unsigned initial_fds = fd_count();
@@ -1682,6 +1840,138 @@ static void test_telemetry_disabled(void)
     CHECK(unsetenv("DMD_VIDEO_STATS") == 0);
 }
 
+/* Exercise the real decode frontend before any compressed payload is sent.
+ * A profile gate alone must never allow mixed NV12/P010 bytes or 9/12-bit
+ * syntax to enter a negotiated fixed-depth context. No HW frame is claimed. */
+static void check_hevc_picture_format(VAProfile profile, unsigned surface_format,
+                                      unsigned luma, unsigned chroma,
+                                      unsigned chroma_format, unsigned separate,
+                                      VAStatus expected)
+{
+    struct fixture f;
+    init_driver(&f);
+    const int ten_bit = profile == VAProfileHEVCMain10;
+    /* Chrome's Main10 capability/config request is RT8 even when the actual
+     * ten-bit picture targets P010. It must not fix the frame's bit depth. */
+    VAConfigAttrib attribute = { VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420 };
+    OK(f.vt.vaCreateConfig(&f.va, profile, VAEntrypointVLD, &attribute, 1, &f.config));
+    OK(f.vt.vaCreateSurfaces2(&f.va, surface_format, 128, 96,
+                              &f.surface, 1, NULL, 0));
+    OK(f.vt.vaCreateContext(&f.va, f.config, 128, 96, VA_PROGRESSIVE,
+                            &f.surface, 1, &f.context));
+    struct dmd_driver *driver = dmd_get_driver(&f.va);
+    pthread_mutex_lock(&driver->lock);
+    struct dmd_context *context = dmd_find_context_locked(driver, f.context);
+    CHECK(context && context->output_ten_bit == ten_bit && !context->hevc_pic_param_valid);
+    pthread_mutex_unlock(&driver->lock);
+    OK(f.vt.vaBeginPicture(&f.va, f.context, f.surface));
+    VAPictureParameterBufferHEVC picture = { 0 };
+    picture.pic_width_in_luma_samples = 128;
+    picture.pic_height_in_luma_samples = 96;
+    picture.bit_depth_luma_minus8 = luma;
+    picture.bit_depth_chroma_minus8 = chroma;
+    picture.pic_fields.bits.chroma_format_idc = chroma_format;
+    picture.pic_fields.bits.separate_colour_plane_flag = separate;
+    VABufferID buffer = make_buffer(&f, VAPictureParameterBufferType, sizeof(picture), &picture);
+    CHECK(f.vt.vaRenderPicture(&f.va, f.context, &buffer, 1) == expected);
+    pthread_mutex_lock(&driver->lock);
+    context = dmd_find_context_locked(driver, f.context);
+    CHECK(context);
+    if (expected == VA_STATUS_SUCCESS) {
+        CHECK(context->hevc_pic_param_valid && context->output_ten_bit == (luma == 2));
+        CHECK(context->hevc_pic_param.bit_depth_luma_minus8 == luma);
+    } else {
+        CHECK(!context->hevc_pic_param_valid && context->output_ten_bit == ten_bit);
+    }
+    pthread_mutex_unlock(&driver->lock);
+    OK(f.vt.vaDestroyBuffer(&f.va, buffer));
+    OK(f.vt.vaDestroyContext(&f.va, f.context));
+    OK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1));
+    OK(f.vt.vaDestroyConfig(&f.va, f.config));
+    finish_driver(&f);
+}
+
+static void test_hevc_picture_depth_guards(void)
+{
+    check_hevc_picture_format(VAProfileHEVCMain, VA_RT_FORMAT_YUV420,
+                              0, 0, 1, 0, VA_STATUS_SUCCESS);
+    check_hevc_picture_format(VAProfileHEVCMain, VA_RT_FORMAT_YUV420,
+                              2, 2, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain, VA_RT_FORMAT_YUV420_10,
+                              0, 0, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+#ifdef DMD_ENABLE_HEVC_MAIN10
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420,
+                              0, 0, 1, 0, VA_STATUS_SUCCESS);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              2, 2, 1, 0, VA_STATUS_SUCCESS);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420,
+                              2, 2, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              0, 0, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              2, 0, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              1, 1, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              4, 4, 1, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              2, 2, 2, 0, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    check_hevc_picture_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10,
+                              2, 2, 1, 1, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+#endif
+}
+
+#ifdef DMD_ENABLE_HEVC_MAIN10
+static void test_hevc_main10_depth_is_fixed(void)
+{
+    for (unsigned first_ten = 0; first_ten < 2; first_ten++) {
+        struct fixture f;
+        init_driver(&f);
+        VAConfigAttrib attribute = { VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420 };
+        OK(f.vt.vaCreateConfig(&f.va, VAProfileHEVCMain10, VAEntrypointVLD,
+                               &attribute, 1, &f.config));
+        VASurfaceID surfaces[2];
+        OK(f.vt.vaCreateSurfaces2(&f.va, VA_RT_FORMAT_YUV420, 128, 96,
+                                  &surfaces[0], 1, NULL, 0));
+        OK(f.vt.vaCreateSurfaces2(&f.va, VA_RT_FORMAT_YUV420_10, 128, 96,
+                                  &surfaces[1], 1, NULL, 0));
+        /* A render-target list is an allocation pool, not a depth selection. */
+        OK(f.vt.vaCreateContext(&f.va, f.config, 128, 96, VA_PROGRESSIVE,
+                                surfaces, 2, &f.context));
+        VAPictureParameterBufferHEVC picture = { 0 };
+        picture.pic_width_in_luma_samples = 128;
+        picture.pic_height_in_luma_samples = 96;
+        picture.pic_fields.bits.chroma_format_idc = 1;
+        for (unsigned step = 0; step < 3; step++) {
+            unsigned depth = step == 1 ? !first_ten : first_ten;
+            OK(f.vt.vaBeginPicture(&f.va, f.context, surfaces[depth]));
+            picture.bit_depth_luma_minus8 = picture.bit_depth_chroma_minus8 = depth ? 2 : 0;
+            VABufferID buffer = make_buffer(&f, VAPictureParameterBufferType,
+                                            sizeof(picture), &picture);
+            VAStatus expected = step == 1 ? VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT : VA_STATUS_SUCCESS;
+            CHECK(f.vt.vaRenderPicture(&f.va, f.context, &buffer, 1) == expected);
+            OK(f.vt.vaDestroyBuffer(&f.va, buffer));
+            struct dmd_driver *driver = dmd_get_driver(&f.va);
+            pthread_mutex_lock(&driver->lock);
+            struct dmd_context *context = dmd_find_context_locked(driver, f.context);
+            CHECK(context && context->hevc_pic_param_valid &&
+                  context->output_ten_bit == (int)first_ten && !context->units_submitted);
+            CHECK(context->hevc_pic_param.bit_depth_luma_minus8 == (first_ten ? 2u : 0u));
+            pthread_mutex_unlock(&driver->lock);
+            /* No compressed payload: finish the test transaction without
+             * claiming that a hardware frame was produced. The depth lock must
+             * survive errors and the next BeginPicture. */
+            CHECK(f.vt.vaEndPicture(&f.va, f.context) ==
+                  (step == 1 ? VA_STATUS_ERROR_INVALID_CONTEXT : VA_STATUS_ERROR_UNIMPLEMENTED));
+        }
+        OK(f.vt.vaDestroyContext(&f.va, f.context));
+        OK(f.vt.vaDestroySurfaces(&f.va, surfaces, 2));
+        OK(f.vt.vaDestroyConfig(&f.va, f.config));
+        finish_driver(&f);
+    }
+}
+#endif
+
 int main(void)
 {
     CHECK(unsetenv("DMD_VIDEO_STATS") == 0);
@@ -1697,11 +1987,17 @@ int main(void)
     test_prime_size_discovery();
     test_concurrent_import_destruction();
     test_prime_sync_failure();
+    test_image_only_surface_dimensions();
+    test_codec_context_minimums();
     test_write_export_encoder_input();
     test_legacy_image_prime_interop();
     test_direct_derived_upload();
     test_export_destroy_race();
     test_decode_hardware_telemetry();
+    test_hevc_picture_depth_guards();
+#ifdef DMD_ENABLE_HEVC_MAIN10
+    test_hevc_main10_depth_is_fixed();
+#endif
     test_telemetry_disabled();
     CHECK(fake_live == 0);
     CHECK(fake_open_calls == fake_close_calls);

@@ -50,6 +50,12 @@ CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
 ifeq ($(AV1),1)
 CFLAGS  += -DDMD_ENABLE_AV1
 endif
+# HEVC10=1 enables only the experimental Main10/P010 decoder. Keep the
+# default capability set unchanged while wider platform/app validation continues.
+# It neither enables VP9 Profile2 nor adds 10-bit encoding support.
+ifeq ($(HEVC10),1)
+CFLAGS  += -DDMD_ENABLE_HEVC_MAIN10
+endif
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
@@ -72,11 +78,14 @@ TESTBIN   := $(BUILD)/test_av1_bitstream
 TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
           $(SRCDIR)/bitstream.c
 ENCODE_TESTBIN := $(BUILD)/test_encode_api
+ENCODE_HEVC10_TESTBIN := $(BUILD)/test_encode_api_hevc10
 ENCODE_FRONT_TESTBIN := $(BUILD)/test_encode_frontend
 ENCODE_BACK_TESTBIN := $(BUILD)/test_v4l2_encoder
 STATS_TESTBIN := $(BUILD)/test_video_stats
 HEVC_TESTBIN := $(BUILD)/test_hevc_slice
 IMAGE_INTEROP_TESTBIN := $(BUILD)/test_image_interop
+PROFILE_TESTBINS := $(BUILD)/test_profiles_default $(BUILD)/test_profiles_hevc10 $(BUILD)/test_profiles_hevc10_av1
+CAPTURE_TESTBIN := $(BUILD)/test_v4l2_capture
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -84,7 +93,7 @@ LIBDIR  ?= $(PREFIX)/lib/aarch64-linux-gnu
 DRIDIR  ?= $(LIBDIR)/dri
 DESTDIR ?=
 
-.PHONY: all clean install uninstall check gen tests probe-va-encode firefox-compat install-firefox-compat
+.PHONY: all clean install uninstall check gen tests probe-va-encode probe-p010-egl probe-hevc-lag firefox-compat install-firefox-compat
 
 all: $(BUILD)/$(TARGET)
 
@@ -96,6 +105,23 @@ install-firefox-compat: firefox-compat
 	install -m 0644 firefox-compat/build/libdmd-firefox-compat.so $(DESTDIR)/usr/local/lib/droidspaces-firefox/libdmd-firefox-compat.so
 
 probe-va-encode: $(BUILD)/probe_va_encode
+
+# Optional graphics probe only: all/tests do not require EGL/GLES development
+# files or link these libraries. Override for a header bundle/runtime-only host.
+P010_EGL_CFLAGS ?= $(shell pkg-config --cflags egl glesv2 2>/dev/null)
+P010_EGL_LIBS ?= $(shell pkg-config --libs egl glesv2 2>/dev/null || echo '-lEGL -lGLESv2')
+
+probe-p010-egl: $(BUILD)/probe_p010_egl
+
+$(BUILD)/probe_p010_egl: tools/probe_p010_egl.c | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(DRM_CFLAGS) $(P010_EGL_CFLAGS) $< $(P010_EGL_LIBS) -lm -o $@
+
+# Explicit hardware diagnostic. Neither all nor tests runs/depends on this tool.
+probe-hevc-lag: $(BUILD)/probe_hevc_lag
+
+$(BUILD)/probe_hevc_lag: tools/probe_hevc_lag.c $(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h $(SRCDIR)/sandbox_heap.h $(SRCDIR)/video_stats.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) -I$(SRCDIR) tools/probe_hevc_lag.c \
+		$(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c -lpthread -o $@
 
 $(BUILD)/probe_va_encode: tools/probe_va_encode.c $(OBJECTS)
 	$(CC) $(CFLAGS) $< $(OBJECTS) $(LDLIBS) -o $@
@@ -118,15 +144,20 @@ check: $(BUILD)/$(TARGET)
 
 # 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN)
+tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN) $(PROFILE_TESTBINS) $(CAPTURE_TESTBIN)
 	@echo "== 运行单元测试 =="
 	@$(TESTBIN)
 	@$(ENCODE_TESTBIN)
+	@$(ENCODE_HEVC10_TESTBIN)
 	@$(ENCODE_FRONT_TESTBIN)
 	@$(ENCODE_BACK_TESTBIN)
 	@$(STATS_TESTBIN)
 	@$(HEVC_TESTBIN)
 	@$(IMAGE_INTEROP_TESTBIN)
+	@$(BUILD)/test_profiles_default
+	@$(BUILD)/test_profiles_hevc10
+	@$(BUILD)/test_profiles_hevc10_av1
+	@$(CAPTURE_TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
@@ -136,8 +167,9 @@ TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 $(TESTBIN): $(TEST_SRCS) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
 
-$(ENCODE_TESTBIN): $(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+$(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN): $(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) $(wildcard $(SRCDIR)/*.h) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(if $(filter $(ENCODE_HEVC10_TESTBIN),$@),-DDMD_ENABLE_HEVC_MAIN10) \
 		$(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) -lpthread -o $@
 
 $(ENCODE_FRONT_TESTBIN): $(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(SRCDIR)/video_stats.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
@@ -151,9 +183,21 @@ $(HEVC_TESTBIN): $(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/h
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
 		$(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/bitstream.c -lpthread -o $@
 
-$(IMAGE_INTEROP_TESTBIN): $(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+$(IMAGE_INTEROP_TESTBIN): $(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c $(SRCDIR)/export.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
 		$(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c -lpthread -o $@
+
+# Exercise independent capability gates without opening any device. Explicit
+# defines make both the default-off and enabled contracts run in every build.
+$(PROFILE_TESTBINS): $(TESTDIR)/test_profiles_hevc10.c $(SRCDIR)/profiles.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		-UDMD_PROBE_10BIT_PROFILES -UDMD_ENABLE_HEVC_MAIN10 -UDMD_ENABLE_AV1 \
+		$(if $(filter $(BUILD)/test_profiles_hevc10 $(BUILD)/test_profiles_hevc10_av1,$@),-DDMD_ENABLE_HEVC_MAIN10) \
+		$(if $(filter $(BUILD)/test_profiles_hevc10_av1,$@),-DDMD_ENABLE_AV1) \
+		$(TESTDIR)/test_profiles_hevc10.c $(SRCDIR)/profiles.c -lpthread -o $@
+
+$(CAPTURE_TESTBIN): $(TESTDIR)/test_v4l2_capture.c $(SRCDIR)/v4l2_backend.c $(SRCDIR)/v4l2_backend.h $(SRCDIR)/sandbox_heap.h $(SRCDIR)/video_stats.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_v4l2_capture.c -o $@
 
 $(ENCODE_BACK_TESTBIN): $(TESTDIR)/test_v4l2_encoder.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/v4l2_encoder.h | $(BUILD)
 	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_v4l2_encoder.c -o $@

@@ -420,6 +420,8 @@ struct dmd_context {
     /* 已向会话报过位深没有：0=还没报，1=报的 8bit，2=报的 10bit。
      * CAPTURE 协商发生在首个单元送出的 SOURCE_CHANGE 里，而 vaCreateContext
      * 阶段还拿不到位深，所以只能在首次 EndPicture 见到 PPB 时补告。 */
+    /* Effective output sample size, also preserved when HEVC sessions reopen. */
+    int output_ten_bit;
     int av1_bd_reported;
     VADecPictureParameterBufferAV1 av1_pic_param;
     VASliceParameterBufferAV1 av1_tile_param[512];

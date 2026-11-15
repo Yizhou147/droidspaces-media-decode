@@ -7,8 +7,8 @@
  * VP8 未实现：驱动侧缺 VP8 的码流重建（RFC 6386 uncompressed chunk 合成）。
  * ⚠️ 注意不是硬件不支持 —— 实测 /dev/video32 的 OUTPUT 格式确实含 VP80，
  * 见本文件下方声明表的更正说明。
- * 高位深（HEVC Main10、VP9 Profile2、H.264 High10）未验证，因此不声明 ——
- * 谎报能力会让消费者选中我们然后失败，比不报更糟。
+ * HEVC Main10/P010 已在 SM8750P 通过像素验证，使用 HEVC10=1 独立启用；
+ * 默认仍关闭，待更多平台/应用验证。VP9 Profile2、H.264 High10 不在此范围。
  */
 
 #include <string.h>
@@ -70,7 +70,8 @@ static void encode_dimensions(VAProfile profile, unsigned *min_w, unsigned *min_
  * HEVC 的 SPS 参考集可在受支持的 Main 8 位流中，根据 VA DPB/POC
  * 重建为显式切片内参考集。SPS 长期参考表、自定义缩放表和未知切片
  * 边界等仍须经过 dmd_hevc_can_build / hevc_slice.c 的限制检查；
- * 不能把该支持范围扩展解释为 Main10 或任意 HEVC 流均已验证。
+ * Main10 复用这些限制，并额外严格核对 10 位参数与 P010 输出；
+ * 不能将受限支持解释为任意 HEVC 流均已验证。
  */
 static const VAProfile dmd_profiles[] = {
     VAProfileH264ConstrainedBaseline,
@@ -78,12 +79,17 @@ static const VAProfile dmd_profiles[] = {
     VAProfileH264High,
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
+#if defined(DMD_ENABLE_HEVC_MAIN10) || defined(DMD_PROBE_10BIT_PROFILES)
+    /* HEVC10=1: independently gated Main10/P010 decode validation. This does
+     * not enable 10-bit encoding, VP9 Profile2, or browser plane imports. */
+    VAProfileHEVCMain10,
+#endif
 #ifdef DMD_PROBE_10BIT_PROFILES
     /* 探测专用（-DDMD_PROBE_10BIT_PROFILES）：声明 10bit profile 好让
      * ffmpeg 愿意把 Main10 / VP9 Profile2 码流交过来，配合运行时的
      * DMD_PROBE_10BIT=1 判定固件是否真能解。
-     * ⚠️ 不要在发布版打开：上层像素路径全是 8bit NV12 假设，会输出错画面。 */
-    VAProfileHEVCMain10,
+     * 此旧诊断开关同时声明尚未验证的 VP9 Profile2；Main10 请用独立
+     * HEVC10=1。QP10/Q12A 等私有探测布局不属于标准 P010 支持。 */
     VAProfileVP9Profile2,
 #endif
     /* VP8：0.4.2 重新声明。
@@ -216,10 +222,12 @@ int dmd_profile_to_codec(VAProfile profile)
     case VAProfileMPEG2Simple:
     case VAProfileMPEG2Main:
         return DMD_CODEC_MPEG2;
-#ifdef DMD_PROBE_10BIT_PROFILES
-    /* 探测专用：走同一个 V4L2 codec，位深由码流序列头自述。 */
+#if defined(DMD_ENABLE_HEVC_MAIN10) || defined(DMD_PROBE_10BIT_PROFILES)
     case VAProfileHEVCMain10:
         return DMD_CODEC_HEVC;
+#endif
+#ifdef DMD_PROBE_10BIT_PROFILES
+    /* Legacy standalone VP9 Profile2 probe; HEVC10 does not enable this. */
     case VAProfileVP9Profile2:
         return DMD_CODEC_VP9;
 #endif
@@ -298,16 +306,14 @@ VAStatus dmd_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
 
 /* 该 profile 允许的 RTFormat。
  *
- * 只有 AV1 多通告一个 VA_RT_FORMAT_YUV420_10：Venus 在 10bit AV1 码流下
- * 接受线性 P010 输出（实测 640x384 → stride=1280 sizeimage=737280），
- * 而其他 codec 的 CAPTURE 一直是 NV12，通告 10bit 就是虚报 ——
- * 消费者会拿它去建 10bit surface，再收到 8bit 像素。
- *
- * 这是整条 10bit 路径的**入口开关**：ffmpeg 的 vaapi 解码器按
- * avctx->pix_fmt（10bit AV1 → P010）查这里要 RTFormat，拿不到就直接
- * "Your platform doesn't support hardware accelerated AV1 decoding"。 */
+ * HEVC Main10 and AV1 Profile0 can carry 8- or 10-bit samples. The frame's
+ * syntax and target surface select NV12/P010; this does not imply conversion
+ * between bit depths. Chrome also requires YUV420 in Main10 capability/config
+ * probes even when its actual ten-bit frames use P010 surfaces. */
 static uint32_t rt_formats_for_profile(VAProfile profile)
 {
+    if (profile == VAProfileHEVCMain10)
+        return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
     if (profile == VAProfileAV1Profile0)
         return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
     return VA_RT_FORMAT_YUV420;
@@ -355,7 +361,6 @@ VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
         }
         switch (attrib_list[i].type) {
         case VAConfigAttribRTFormat:
-            /* 8-bit 4:2:0 NV12；AV1 再加一个 10-bit P010。 */
             attrib_list[i].value = rt_formats_for_profile(profile);
             break;
         case VAConfigAttribMaxPictureWidth:
@@ -424,6 +429,14 @@ VAStatus dmd_CreateConfig(VADriverContextP ctx, VAProfile profile,
                 return VA_STATUS_ERROR_ATTR_NOT_SUPPORTED;
             }
         }
+    }
+
+    if (!encoding && profile == VAProfileHEVCMain10) {
+        for (int i = 0; i < num_attribs; i++)
+            if (attrib_list[i].type == VAConfigAttribRTFormat &&
+                (!attrib_list[i].value ||
+                 (attrib_list[i].value & ~rt_formats_for_profile(profile))))
+                return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
 
     VAStatus status = VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -579,14 +592,14 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     if (encoding)
         encode_dimensions(cfg_profile, &min_w, &min_h, &max_w, &max_h);
 
-    /* P010 与 NV12 是两个并列的 PixelFormat 属性项（VA-API 允许多个同 type
-     * 的项，消费者按 value 匹配自己要的格式）。只给 AV1 多这一项 ——
-     * 与 rt_formats_for_profile() 同一个门槛。 */
-    const int ten_bit = (rt_formats_for_profile(cfg_profile) &
-                         VA_RT_FORMAT_YUV420_10) != 0;
+    /* Main10/AV1 expose NV12 and P010 for matching 8/10-bit frame syntax;
+     * HEVC Main and all encoders remain NV12-only. */
+    const uint32_t rt = encoding ? VA_RT_FORMAT_YUV420 : rt_formats_for_profile(cfg_profile);
+    const int eight_bit = (rt & VA_RT_FORMAT_YUV420) != 0;
+    const int ten_bit = (rt & VA_RT_FORMAT_YUV420_10) != 0;
 
     /* VA-API 约定的两段式查询：attrib_list 为 NULL 时只回报数量。 */
-    const unsigned int needed = (ten_bit ? 6u : 5u) + (encoding ? 1u : 0u);
+    const unsigned int needed = 4u + eight_bit + ten_bit + (encoding ? 1u : 0u);
     if (!attrib_list) {
         *num_attribs = needed;
         return VA_STATUS_SUCCESS;
@@ -598,11 +611,13 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
 
     unsigned int n = 0;
 
-    attrib_list[n].type = VASurfaceAttribPixelFormat;
-    attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
-    attrib_list[n].value.type = VAGenericValueTypeInteger;
-    attrib_list[n].value.value.i = VA_FOURCC_NV12;
-    n++;
+    if (eight_bit) {
+        attrib_list[n].type = VASurfaceAttribPixelFormat;
+        attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+        attrib_list[n].value.type = VAGenericValueTypeInteger;
+        attrib_list[n].value.value.i = VA_FOURCC_NV12;
+        n++;
+    }
 
     if (ten_bit) {
         attrib_list[n].type = VASurfaceAttribPixelFormat;

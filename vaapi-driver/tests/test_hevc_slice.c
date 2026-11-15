@@ -1,5 +1,6 @@
-/* Pure HEVC ST-RPS rewrite tests: syntax, semantic reference ordering and
- * byte-for-byte CABAC preservation. No hardware or software decoder. */
+/* Pure HEVC ST-RPS rewrite tests: Main/Main10 syntax, generated parameter
+ * sets, semantic reference ordering and byte-for-byte CABAC preservation.
+ * No hardware or software decoder. */
 #include "driver.h"
 #include "hevc_slice.h"
 #include "bitstream.h"
@@ -22,6 +23,11 @@ static unsigned golomb(struct bits *b)
     unsigned n = 0;
     while (!u(b, 1)) CHECK(++n < 31);
     return ((1u << n) - 1) + u(b, n);
+}
+static int signed_golomb(struct bits *b)
+{
+    unsigned code = golomb(b);
+    return code & 1 ? (int)((code + 1) / 2) : -(int)(code / 2);
 }
 static size_t deescape(const uint8_t *src, size_t size, uint8_t *out)
 {
@@ -303,6 +309,161 @@ static void test_invalid_entries_ignored(void)
     check_rewrite(&a);
 }
 
+static void test_main10_rewrite(void)
+{
+    /* The edited prefix is independent of bit depth. Exercise both original
+     * RPS encodings, non-first/dependent segments, both IDR forms and CRA.
+     * The suffix includes LT fields and EPB-sensitive opaque CABAC bytes;
+     * check_rewrite verifies every one of those bits/bytes is retained. */
+    static const unsigned cases[][4] = {
+        { 1, 1, 0, 1 }, { 1, 1, 0, 0 }, { 1, 0, 0, 1 },
+        { 1, 0, 1, 1 }, { 19, 1, 0, 0 }, { 20, 1, 0, 0 }, { 21, 1, 0, 1 }
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        struct sample a;
+        make_sample(&a, cases[i][0], cases[i][1], cases[i][2], cases[i][3]);
+        a.p.bit_depth_luma_minus8 = a.p.bit_depth_chroma_minus8 = 2;
+        a.p.init_qp_minus26 = -30; /* legal only with the 10-bit QpBdOffset */
+        CHECK(dmd_hevc_can_build(&a.p));
+        check_rewrite(&a);
+    }
+    /* Main10 must retain the same explicit exclusions as the 8-bit rewrite. */
+    struct sample a;
+    make_sample(&a, 1, 1, 0, 1);
+    a.p.bit_depth_luma_minus8 = a.p.bit_depth_chroma_minus8 = 2;
+    VAPictureParameterBufferHEVC invalid[5];
+    for (unsigned i = 0; i < 5; ++i) invalid[i] = a.p;
+    invalid[0].pic_fields.bits.scaling_list_enabled_flag = 1;
+    invalid[1].num_long_term_ref_pic_sps = 1;
+    invalid[2].pic_fields.bits.chroma_format_idc = 2;
+    invalid[3].CurrPic.flags = VA_PICTURE_HEVC_FIELD_PIC;
+    invalid[4].bit_depth_chroma_minus8 = 0;
+    for (unsigned i = 0; i < 5; ++i) {
+        uint8_t output[8192]; size_t length = 99;
+        CHECK(!dmd_hevc_can_build(&invalid[i]));
+        CHECK(dmd_hevc_rewrite_slice(&invalid[i], &a.s, a.input, a.input_size,
+                                     output, sizeof(output), &length) < 0);
+        CHECK(errno == ENOTSUP && length == 0);
+    }
+}
+
+static void check_ptl(struct bits *b, unsigned profile, unsigned level)
+{
+    CHECK(u(b, 2) == 0 && u(b, 1) == 0 && u(b, 5) == profile);
+    for (unsigned i = 0; i < 32; ++i) CHECK(u(b, 1) == (i == profile));
+    CHECK(u(b, 4) == 9); /* progressive + frame_only */
+    /* For Main10 these zeros also express one_picture_only_constraint=0,
+     * rather than accidentally advertising an intra/still-picture stream. */
+    CHECK(u(b, 22) == 0 && u(b, 21) == 0 && u(b, 1) == 0);
+    CHECK(u(b, 8) == level);
+}
+
+static void test_parameter_sets(void)
+{
+    uint8_t nalu[1024], rbsp[1024];
+    static const struct { VAProfile profile; unsigned depth, profile_idc; } cases[] = {
+        { VAProfileHEVCMain, 0, 1 },
+        { VAProfileHEVCMain10, 0, 2 },
+        { VAProfileHEVCMain10, 2, 2 }
+    };
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c)
+        for (unsigned pcm = 0; pcm < 2; ++pcm) {
+            unsigned depth = cases[c].depth;
+            VAPictureParameterBufferHEVC p;
+            picture(&p);
+            p.bit_depth_luma_minus8 = p.bit_depth_chroma_minus8 = depth;
+            p.sps_max_dec_pic_buffering_minus1 = 5;
+            p.init_qp_minus26 = depth ? -30 : -26;
+            p.pic_fields.bits.pcm_enabled_flag = pcm;
+            p.pcm_sample_bit_depth_luma_minus1 = p.pcm_sample_bit_depth_chroma_minus1 = 7 + depth;
+            VAProfile profile = cases[c].profile;
+            unsigned profile_idc = cases[c].profile_idc;
+            CHECK(dmd_hevc_can_build(&p));
+
+            size_t n = dmd_hevc_build_vps_nalu(&p, profile, nalu, sizeof(nalu));
+            CHECK(n > 6 && !memcmp(nalu, "\0\0\0\1\x40\x01", 6));
+            size_t length = deescape(nalu + 6, n - 6, rbsp);
+            struct bits b = { rbsp, 0, length };
+            CHECK(u(&b, 4) == 0 && u(&b, 2) == 3 && u(&b, 6) == 0);
+            CHECK(u(&b, 3) == 0 && u(&b, 1) == 1 && u(&b, 16) == 65535);
+            check_ptl(&b, profile_idc, 30);
+
+            n = dmd_hevc_build_sps_nalu(&p, profile, nalu, sizeof(nalu));
+            CHECK(n > 6 && !memcmp(nalu, "\0\0\0\1\x42\x01", 6));
+            length = deescape(nalu + 6, n - 6, rbsp);
+            b = (struct bits){ rbsp, 0, length };
+            CHECK(u(&b, 4) == 0 && u(&b, 3) == 0 && u(&b, 1) == 1);
+            check_ptl(&b, profile_idc, 30);
+            CHECK(golomb(&b) == 0 && golomb(&b) == 1);
+            CHECK(golomb(&b) == 128 && golomb(&b) == 96 && u(&b, 1) == 0);
+            CHECK(golomb(&b) == depth && golomb(&b) == depth);
+            CHECK(golomb(&b) == 4 && u(&b, 1) == 0);
+            CHECK(golomb(&b) == 5 && golomb(&b) == 5 && golomb(&b) == 0);
+            CHECK(golomb(&b) == 0 && golomb(&b) == 3);
+            CHECK(golomb(&b) == 0 && golomb(&b) == 0);
+            CHECK(golomb(&b) == 0 && golomb(&b) == 0);
+            CHECK(u(&b, 1) == 0 && u(&b, 1) == 0 && u(&b, 1) == 0);
+            CHECK(u(&b, 1) == pcm);
+            if (pcm) {
+                CHECK(u(&b, 4) == 7 + depth && u(&b, 4) == 7 + depth);
+                CHECK(golomb(&b) == 0 && golomb(&b) == 0 && u(&b, 1) == 0);
+            }
+            CHECK(golomb(&b) == 0); /* ST-RPS table removed, slice is rewritten */
+            CHECK(u(&b, 1) == 1 && golomb(&b) == 0); /* no fabricated LT entries */
+            CHECK(u(&b, 1) == 0 && u(&b, 1) == 0); /* temporal MVP + smoothing */
+            CHECK(u(&b, 1) == 0 && u(&b, 1) == 0); /* VUI + extensions */
+            CHECK(u(&b, 1) == 1);
+            while (b.pos < length * 8) CHECK(u(&b, 1) == 0);
+
+            n = dmd_hevc_build_pps_nalu(&p, nalu, sizeof(nalu));
+            CHECK(n > 6 && !memcmp(nalu, "\0\0\0\1\x44\x01", 6));
+            length = deescape(nalu + 6, n - 6, rbsp);
+            b = (struct bits){ rbsp, 0, length };
+            CHECK(golomb(&b) == 0 && golomb(&b) == 0);
+            CHECK(u(&b, 1) == 1 && u(&b, 1) == 0 && u(&b, 3) == 0);
+            CHECK(u(&b, 1) == 0 && u(&b, 1) == 0);
+            CHECK(golomb(&b) == 0 && golomb(&b) == 0);
+            CHECK(signed_golomb(&b) == p.init_qp_minus26);
+        }
+
+    VAPictureParameterBufferHEVC p;
+    picture(&p);
+    /* Invalid/foreign VA profiles must not fall through to Main and falsely
+     * advertise a different format. The full parse above checks that a
+     * Main10 PTL really keeps an 8-bit SPS, including its PCM/QP values. */
+    p.bit_depth_luma_minus8 = p.bit_depth_chroma_minus8 = 2;
+    CHECK(dmd_hevc_build_sps_nalu(&p, VAProfileHEVCMain, nalu, sizeof(nalu)) == 0);
+    CHECK(dmd_hevc_build_vps_nalu(&p, VAProfileHEVCMain, nalu, sizeof(nalu)) == 0);
+    CHECK(dmd_hevc_build_sps_nalu(&p, VAProfileHEVCMain12, nalu, sizeof(nalu)) == 0);
+    CHECK(dmd_hevc_build_vps_nalu(&p, VAProfileNone, nalu, sizeof(nalu)) == 0);
+    CHECK(dmd_hevc_build_pps_nalu(NULL, nalu, sizeof(nalu)) == 0);
+
+    for (unsigned rps = 0; rps <= 4; rps += 4)
+        for (unsigned luma = 0; luma <= 4; ++luma)
+            for (unsigned chroma = 0; chroma <= 4; ++chroma) {
+                picture(&p);
+                p.num_short_term_ref_pic_sets = rps;
+                p.bit_depth_luma_minus8 = luma;
+                p.bit_depth_chroma_minus8 = chroma;
+                int supported = luma == chroma && (luma == 0 || luma == 2);
+                CHECK(dmd_hevc_can_build(&p) == supported);
+                CHECK((dmd_hevc_build_sps_nalu(&p, VAProfileHEVCMain10,
+                                               nalu, sizeof(nalu)) > 0) == supported);
+                CHECK((dmd_hevc_build_vps_nalu(&p, VAProfileHEVCMain10,
+                                               nalu, sizeof(nalu)) > 0) == supported);
+                CHECK((dmd_hevc_build_sps_nalu(&p, VAProfileHEVCMain,
+                                               nalu, sizeof(nalu)) > 0) == (supported && luma == 0));
+                CHECK((dmd_hevc_build_vps_nalu(&p, VAProfileHEVCMain,
+                                               nalu, sizeof(nalu)) > 0) == (supported && luma == 0));
+            }
+    picture(&p); p.bit_depth_luma_minus8 = p.bit_depth_chroma_minus8 = 2;
+    p.pic_fields.bits.pcm_enabled_flag = 1;
+    p.pcm_sample_bit_depth_luma_minus1 = 10; /* 11-bit PCM in a 10-bit SPS */
+    CHECK(!dmd_hevc_can_build(&p));
+    picture(&p); p.pic_fields.bits.chroma_format_idc = 2;
+    CHECK(!dmd_hevc_can_build(&p));
+}
+
 int main(void)
 {
     struct sample a;
@@ -316,6 +477,8 @@ int main(void)
     test_rejects();
     test_multiple_slices();
     test_invalid_entries_ignored();
-    puts("HEVC inline RPS rewrite: SPS/index/inline, ST_FOLL/LT, IDR/CRA, dependent slices, EPB/CABAC and rejection PASS");
+    test_main10_rewrite();
+    test_parameter_sets();
+    puts("HEVC Main/Main10: parameter sets/profile/depth, RPS, ST_FOLL/LT, IDR/CRA, dependent slices, EPB/CABAC and rejection PASS");
     return 0;
 }

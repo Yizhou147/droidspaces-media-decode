@@ -1,4 +1,4 @@
-/* Contract checks for VLC 3's pre-decode derive/PRIME-import probe.
+/* Contract checks for derive/PRIME-import and VA surface export descriptors.
  * A real shared memfd models the exported allocation; only the DRM export
  * ioctl and pending decode completion are mocked. No hardware claim is made.
  * Build: cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Wno-unused-parameter \
@@ -17,7 +17,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <drm/drm.h>
+#include <drm_fourcc.h>
 #include "driver.h"
+
+/* Keep the descriptor checks on the production export implementation while
+ * this executable continues to link image.c and reuse its DRM/memfd fixture. */
+#include "../src/export.c"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); \
@@ -26,6 +31,7 @@
 
 static int allocation_fd = -1, export_error;
 static unsigned export_calls, wait_calls;
+static uint32_t expected_prime_flags;
 static VAStatus wait_status;
 static int remove_during_wait;
 
@@ -46,7 +52,7 @@ int ioctl(int fd, unsigned long request, ...)
         struct drm_prime_handle *prime = arg;
         export_calls++;
         CHECK(prime->handle == 42);
-        CHECK(prime->flags == (DRM_CLOEXEC | DRM_RDWR));
+        CHECK(prime->flags == expected_prime_flags);
         if (export_error) { errno = export_error; return -1; }
         prime->fd = fcntl(allocation_fd, F_DUPFD_CLOEXEC, 3);
         return prime->fd < 0 ? -1 : 0;
@@ -145,6 +151,7 @@ static void start(struct fixture *f)
     f->surface = s;
     export_error = remove_during_wait = 0;
     export_calls = wait_calls = 0;
+    expected_prime_flags = DRM_CLOEXEC | DRM_RDWR;
     wait_status = VA_STATUS_SUCCESS;
 }
 
@@ -156,6 +163,123 @@ static void finish(struct fixture *f)
     allocation_fd = -1;
     pthread_mutex_destroy(&f->drv->lock);
     free(f->drv);
+}
+
+static void export_surface_descriptors(int ten_bit)
+{
+    struct fixture f; start(&f);
+    if (ten_bit) {
+        /* Give 130 visible pixels a legal 16bit pitch and retain 128 storage
+         * rows for a visible height of 98. This detects UV offset=height bugs. */
+        CHECK(munmap(f.surface->data, f.size) == 0);
+        f.surface->format = VA_RT_FORMAT_YUV420_10;
+        f.surface->stride = 512;
+        f.size = (size_t)512 * 128 * 3 / 2;
+        CHECK(ftruncate(allocation_fd, (off_t)f.size) == 0);
+        f.surface->data = mmap(NULL, f.size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, allocation_fd, 0);
+        CHECK(f.surface->data != MAP_FAILED);
+        f.surface->data_size = f.surface->dumb_size = f.size;
+        memset(f.surface->data, 0, f.size);
+        f.surface->data[1] = 0x10; /* Y=64<<6, not low-bit-aligned 64 */
+        size_t uv = (size_t)f.surface->stride * f.surface->slice_height;
+        f.surface->data[uv + 1] = 0x40; /* Cb=256<<6 */
+        f.surface->data[uv + 3] = 0xc0; /* Cr=768<<6 */
+    }
+    const uint32_t flags[] = {
+        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+        VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+        VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+        0, /* Existing default contract: separate layers, read-only PRIME fd. */
+    };
+    for (unsigned i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        VADRMPRIMESurfaceDescriptor desc;
+        memset(&desc, 0xa5, sizeof(desc));
+        expected_prime_flags = DRM_CLOEXEC |
+            ((flags[i] & VA_EXPORT_SURFACE_WRITE_ONLY) ? DRM_RDWR : 0);
+        f.surface->exported = f.surface->external_write_exported = 0;
+        OK(dmd_ExportSurfaceHandle(&f.va, 7, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                   flags[i], &desc));
+        CHECK(export_calls == i + 1 && wait_calls == 0);
+        CHECK(f.surface->state == DMD_SURFACE_IDLE); /* export reads no pixels */
+        CHECK(f.surface->exported && f.surface->external_write_exported ==
+              !!(flags[i] & VA_EXPORT_SURFACE_WRITE_ONLY));
+        CHECK(desc.fourcc == (ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12));
+        CHECK(desc.width == 130 && desc.height == 98);
+        CHECK(desc.num_objects == 1 && desc.objects[0].size == f.size);
+        CHECK(desc.objects[0].drm_format_modifier == DRM_FORMAT_MOD_LINEAR);
+        CHECK(desc.objects[0].fd >= 0);
+        CHECK(fcntl(desc.objects[0].fd, F_GETFD) & FD_CLOEXEC);
+        unsigned uv_layer = flags[i] & VA_EXPORT_SURFACE_COMPOSED_LAYERS ? 0 : 1;
+        unsigned uv_plane = uv_layer ? 0 : 1;
+        CHECK(desc.num_layers == (uv_layer ? 2 : 1));
+        CHECK(desc.layers[0].drm_format == (uv_layer ?
+              (ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8) :
+              (ten_bit ? DRM_FORMAT_P010 : DRM_FORMAT_NV12)));
+        CHECK(desc.layers[0].num_planes == (uv_layer ? 1 : 2));
+        CHECK(desc.layers[0].object_index[0] == 0 && desc.layers[0].offset[0] == 0);
+        CHECK(desc.layers[0].pitch[0] == f.surface->stride);
+        if (uv_layer) {
+            CHECK(desc.layers[1].drm_format == (ten_bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88));
+            CHECK(desc.layers[1].num_planes == 1);
+        }
+        CHECK(desc.layers[uv_layer].object_index[uv_plane] == 0);
+        CHECK(desc.layers[uv_layer].pitch[uv_plane] == f.surface->stride);
+        size_t uv = (size_t)f.surface->stride * f.surface->slice_height;
+        CHECK(desc.layers[uv_layer].offset[uv_plane] == uv);
+        CHECK(uv != (size_t)f.surface->stride * desc.height);
+        CHECK(uv + (size_t)f.surface->stride * ((desc.height + 1) / 2) <=
+              desc.objects[0].size);
+        const unsigned char *external = mmap(NULL, f.size, PROT_READ, MAP_SHARED,
+                                             desc.objects[0].fd, 0);
+        CHECK(external != MAP_FAILED && !memcmp(external, f.surface->data, f.size));
+        if (ten_bit) {
+            CHECK(external[0] == 0 && external[1] == 0x10);
+            CHECK(external[uv] == 0 && external[uv + 1] == 0x40);
+            CHECK(external[uv + 2] == 0 && external[uv + 3] == 0xc0);
+        }
+        CHECK(munmap((void *)external, f.size) == 0);
+        CHECK(close(desc.objects[0].fd) == 0); /* one fd/object, not one/layer */
+        CHECK(fcntl(allocation_fd, F_GETFD) >= 0); /* parent allocation remains */
+    }
+    finish(&f);
+}
+
+static void export_surface_failures(void)
+{
+    struct fixture f; start(&f);
+    VADRMPRIMESurfaceDescriptor desc;
+    const uint32_t type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    const uint32_t flags = VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS;
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, type, flags, NULL) == VA_STATUS_ERROR_INVALID_PARAMETER);
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME,
+                                   flags, &desc) == VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 99, type, flags, &desc) == VA_STATUS_ERROR_INVALID_SURFACE);
+    f.surface->exportable = 0;
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, type, flags, &desc) == VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+    f.surface->exportable = 1;
+    CHECK(export_calls == 0);
+    expected_prime_flags = DRM_CLOEXEC;
+    export_error = EIO;
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, type, flags, &desc) == VA_STATUS_ERROR_OPERATION_FAILED);
+    CHECK(export_calls == 1 && !f.surface->exported);
+    export_error = 0;
+    VAImage image;
+    OK(dmd_DeriveImage(&f.va, 7, &image));
+    struct dmd_image *derived = dmd_find_image_locked(f.drv, image.image_id);
+    CHECK(derived);
+    derived->mapped = 1;
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, type, flags, &desc) == VA_STATUS_ERROR_SURFACE_BUSY);
+    derived->mapped = 0;
+    VABufferInfo info = { 0 };
+    expected_prime_flags = DRM_CLOEXEC | DRM_RDWR;
+    OK(dmd_AcquireBufferHandle(&f.va, image.buf, &info));
+    CHECK(dmd_ExportSurfaceHandle(&f.va, 7, type, flags, &desc) == VA_STATUS_ERROR_SURFACE_BUSY);
+    CHECK(export_calls == 2 && wait_calls == 0);
+    OK(dmd_ReleaseBufferHandle(&f.va, image.buf));
+    OK(dmd_DestroyImage(&f.va, image.image_id));
+    finish(&f);
 }
 
 static void allocation_probe_and_handle_lifetime(void)
@@ -315,6 +439,43 @@ static void get_image_rechecks_target_after_wait(void)
     finish(&f);
 }
 
+static void get_image_fills_chroma_padding(int ten_bit)
+{
+    struct fixture f; start(&f);
+    const unsigned sample_bytes = ten_bit ? 2 : 1;
+    /* A source shrunk to 128x64 while the client's image/pool remains 130x98.
+     * Both right-edge and bottom padding must be legal neutral chroma. */
+    f.surface->format = ten_bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+    f.surface->stride = 128 * sample_bytes;
+    f.surface->slice_height = 64;
+    f.surface->data_size = (size_t)f.surface->stride * 64 * 3 / 2;
+    size_t plane = (size_t)f.surface->stride * 64;
+    memset(f.surface->data, 0, f.surface->data_size);
+    for (size_t offset = plane; offset < f.surface->data_size; offset += sample_bytes) {
+        f.surface->data[offset] = ten_bit ? 0 : 0x90;
+        if (ten_bit) f.surface->data[offset + 1] = 0x90;
+    }
+    VAImage image;
+    VAImageFormat format = { .fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12 };
+    OK(dmd_CreateImage(&f.va, &format, 130, 98, &image));
+    struct dmd_image *target = dmd_find_image_locked(f.drv, image.image_id);
+    CHECK(target);
+    memset(target->data, 0xa5, target->data_size);
+    OK(dmd_GetImage(&f.va, 7, 0, 0, 130, 98, image.image_id));
+    for (unsigned y = 0; y < 98 / 2; y++) {
+        for (unsigned x = 0; x < 130; x++) {
+            const unsigned char *sample = target->data + image.offsets[1] +
+                                           (size_t)y * image.pitches[1] + x * sample_bytes;
+            unsigned value = sample[0] | (ten_bit ? (unsigned)sample[1] << 8 : 0);
+            unsigned expected = y < 32 && x < 128 ? (ten_bit ? 0x9000 : 0x90)
+                                                    : (ten_bit ? 0x8000 : 0x80);
+            CHECK(value == expected);
+        }
+    }
+    OK(dmd_DestroyImage(&f.va, image.image_id));
+    finish(&f);
+}
+
 static struct dmd_surface *add_other_surface(struct fixture *f)
 {
     struct dmd_surface *other = &f->drv->surfaces[1];
@@ -439,10 +600,15 @@ static void get_image_rechecks_alias_parent_after_wait(void)
 
 int main(void)
 {
+    export_surface_descriptors(0);
+    export_surface_descriptors(1);
+    export_surface_failures();
     allocation_probe_and_handle_lifetime();
     failure_and_busy_paths();
     validate_storage_and_recheck_after_wait();
     get_image_rechecks_target_after_wait();
+    get_image_fills_chroma_padding(0);
+    get_image_fills_chroma_padding(1);
     cross_surface_derived_alias_locks();
     get_image_rechecks_alias_parent_after_wait();
     puts("image interop: PASS (shared storage, probe, synchronization, lifetime and failures)");

@@ -27,15 +27,16 @@
 /* ---------------------------------------------------------------- 字段推导 */
 
 /* general_profile_idc：VA-API 不提供，从 VAProfile 映射。
- * 只声明了 VAProfileHEVCMain（见 profiles.c），所以固定为 Main=1。 */
+ * 入口会核对 profile/位深，不能把未知 profile 静默声明成 Main。 */
 static unsigned int hevc_profile_idc(VAProfile profile)
 {
     switch (profile) {
     case VAProfileHEVCMain10:
         return 2;   /* Main 10 */
     case VAProfileHEVCMain:
-    default:
         return 1;   /* Main */
+    default:
+        return 0;
     }
 }
 
@@ -220,7 +221,7 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
     }
 
     /* VA-API 不提供原始 SPS 参考集定义；hevc_slice.c 将受支持的
-     * Main 8 位码流改写为显式切片内参考集，因此这里声明 0 个 SPS 集合。
+     * Main/Main10 8/10 位码流改写为显式切片内参考集，因此这里声明 0 个 SPS 集合。
      * 保留旧集合个数而不提供定义会破坏后续语法解析。 */
     dmd_bw_put_ue(&bw, 0);
 
@@ -328,19 +329,48 @@ int dmd_hevc_can_build(const VAPictureParameterBufferHEVC *pp)
 {
     if (!pp)
         return 0;
+    /* The pixel path represents only 4:2:0 with matched 8- or 10-bit planes.
+     * In particular, a Main10 profile does not make 9/12-bit or mixed-depth
+     * syntax safe. PCM samples, when present, cannot exceed the SPS depth.
+     * Syntax checked against FFmpeg n8.0 hevc/ps.c ff_hevc_parse_sps(). */
+    if (pp->pic_fields.bits.chroma_format_idc != 1 ||
+        pp->pic_fields.bits.separate_colour_plane_flag ||
+        pp->bit_depth_luma_minus8 != pp->bit_depth_chroma_minus8 ||
+        (pp->bit_depth_luma_minus8 != 0 && pp->bit_depth_luma_minus8 != 2) ||
+        (pp->pic_fields.bits.pcm_enabled_flag &&
+         (pp->pcm_sample_bit_depth_luma_minus1 >= 8u + pp->bit_depth_luma_minus8 ||
+          pp->pcm_sample_bit_depth_chroma_minus1 >= 8u + pp->bit_depth_chroma_minus8)))
+        return 0;
     if (pp->num_short_term_ref_pic_sets > 0) {
         /* No original LT SPS table or custom scaling-list bytes are exposed
-         * here. The new path handles Main 8-bit, full long-format slices and
+         * here. The new path handles matched 8/10-bit full long-format slices and
          * LT syntax whose source SPS table is empty; do not invent the rest. */
         if (pp->num_short_term_ref_pic_sets > 64 || pp->num_long_term_ref_pic_sps ||
             pp->pic_fields.bits.chroma_format_idc != 1 ||
             pp->pic_fields.bits.separate_colour_plane_flag ||
             pp->pic_fields.bits.scaling_list_enabled_flag ||
-            pp->bit_depth_luma_minus8 || pp->bit_depth_chroma_minus8 ||
             (pp->CurrPic.flags & (VA_PICTURE_HEVC_FIELD_PIC | VA_PICTURE_HEVC_BOTTOM_FIELD)))
             return 0;
     }
     return 1;
+}
+
+static int hevc_profile_matches_picture(const VAPictureParameterBufferHEVC *pp,
+                                        VAProfile profile)
+{
+    if (!dmd_hevc_can_build(pp))
+        return 0;
+    /* Main10 PTL also permits 8-bit pictures. Keep the SPS sample depth from
+     * the matched luma/chroma parameters rather than deriving it from PTL;
+     * the decode frontend separately selects NV12 or P010 for that depth. */
+    switch (profile) {
+    case VAProfileHEVCMain:
+        return pp->bit_depth_luma_minus8 == 0;
+    case VAProfileHEVCMain10:
+        return pp->bit_depth_luma_minus8 == 0 || pp->bit_depth_luma_minus8 == 2;
+    default:
+        return 0;
+    }
 }
 
 /* 把 RBSP 包成带起始码的 NALU：
@@ -367,6 +397,8 @@ size_t dmd_hevc_build_vps_nalu(const VAPictureParameterBufferHEVC *pp,
                                VAProfile profile,
                                unsigned char *out, size_t cap)
 {
+    if (!hevc_profile_matches_picture(pp, profile))
+        return 0;
     unsigned char rbsp[256];
     size_t n = build_vps_rbsp(pp, profile, rbsp, sizeof(rbsp));
     return emit_nalu(32, rbsp, n, out, cap);
@@ -376,6 +408,8 @@ size_t dmd_hevc_build_sps_nalu(const VAPictureParameterBufferHEVC *pp,
                                VAProfile profile,
                                unsigned char *out, size_t cap)
 {
+    if (!hevc_profile_matches_picture(pp, profile))
+        return 0;
     unsigned char rbsp[512];
     size_t n = build_sps_rbsp(pp, profile, rbsp, sizeof(rbsp));
     return emit_nalu(33, rbsp, n, out, cap);
@@ -384,6 +418,8 @@ size_t dmd_hevc_build_sps_nalu(const VAPictureParameterBufferHEVC *pp,
 size_t dmd_hevc_build_pps_nalu(const VAPictureParameterBufferHEVC *pp,
                                unsigned char *out, size_t cap)
 {
+    if (!dmd_hevc_can_build(pp))
+        return 0;
     unsigned char rbsp[512];
     size_t n = build_pps_rbsp(pp, rbsp, sizeof(rbsp));
     return emit_nalu(34, rbsp, n, out, cap);
