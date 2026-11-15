@@ -1,4 +1,4 @@
-# DroidSpaces MediaCodec VA-API driver
+# DroidSpaces V4L2 VA-API driver (decode and encode)
 #
 # 产物名不可更改：libva 从 msm render node 推导出的驱动名就是 msm_drm，
 # 只会尝试打开 <dridir>/msm_drm_drv_video.so 这一个文件（无 fallback）。
@@ -56,8 +56,9 @@ LDLIBS  += -lpthread
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
            $(SRCDIR)/dmd_v4l2_session.c \
           $(SRCDIR)/v4l2_backend.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
-           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c \
-           $(SRCDIR)/av1_bitstream.c $(SRCDIR)/mpeg2_bitstream.c
+           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/export.c \
+           $(SRCDIR)/av1_bitstream.c $(SRCDIR)/mpeg2_bitstream.c \
+           $(SRCDIR)/encode.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/video_stats.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 DEPS    := $(OBJECTS:.o=.d)
 
@@ -70,6 +71,12 @@ TESTDIR   := tests
 TESTBIN   := $(BUILD)/test_av1_bitstream
 TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
           $(SRCDIR)/bitstream.c
+ENCODE_TESTBIN := $(BUILD)/test_encode_api
+ENCODE_FRONT_TESTBIN := $(BUILD)/test_encode_frontend
+ENCODE_BACK_TESTBIN := $(BUILD)/test_v4l2_encoder
+STATS_TESTBIN := $(BUILD)/test_video_stats
+HEVC_TESTBIN := $(BUILD)/test_hevc_slice
+IMAGE_INTEROP_TESTBIN := $(BUILD)/test_image_interop
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -77,9 +84,21 @@ LIBDIR  ?= $(PREFIX)/lib/aarch64-linux-gnu
 DRIDIR  ?= $(LIBDIR)/dri
 DESTDIR ?=
 
-.PHONY: all clean install uninstall check gen tests
+.PHONY: all clean install uninstall check gen tests probe-va-encode firefox-compat install-firefox-compat
 
 all: $(BUILD)/$(TARGET)
+
+firefox-compat:
+	$(MAKE) -C firefox-compat compat
+
+install-firefox-compat: firefox-compat
+	install -d $(DESTDIR)/usr/local/lib/droidspaces-firefox
+	install -m 0644 firefox-compat/build/libdmd-firefox-compat.so $(DESTDIR)/usr/local/lib/droidspaces-firefox/libdmd-firefox-compat.so
+
+probe-va-encode: $(BUILD)/probe_va_encode
+
+$(BUILD)/probe_va_encode: tools/probe_va_encode.c $(OBJECTS)
+	$(CC) $(CFLAGS) $< $(OBJECTS) $(LDLIBS) -o $@
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -99,9 +118,15 @@ check: $(BUILD)/$(TARGET)
 
 # 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN)
+tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN)
 	@echo "== 运行单元测试 =="
 	@$(TESTBIN)
+	@$(ENCODE_TESTBIN)
+	@$(ENCODE_FRONT_TESTBIN)
+	@$(ENCODE_BACK_TESTBIN)
+	@$(STATS_TESTBIN)
+	@$(HEVC_TESTBIN)
+	@$(IMAGE_INTEROP_TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
@@ -110,6 +135,28 @@ TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 # fatal error。既有问题，v0.4.4 及更早同样失败。
 $(TESTBIN): $(TEST_SRCS) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
+
+$(ENCODE_TESTBIN): $(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) -lpthread -o $@
+
+$(ENCODE_FRONT_TESTBIN): $(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(SRCDIR)/video_stats.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(SRCDIR)/video_stats.c -lpthread -o $@
+
+$(STATS_TESTBIN): $(TESTDIR)/test_video_stats.c $(SRCDIR)/video_stats.c $(SRCDIR)/video_stats.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_video_stats.c $(SRCDIR)/video_stats.c -lpthread -o $@
+
+$(HEVC_TESTBIN): $(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/bitstream.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/bitstream.c -lpthread -o $@
+
+$(IMAGE_INTEROP_TESTBIN): $(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c -lpthread -o $@
+
+$(ENCODE_BACK_TESTBIN): $(TESTDIR)/test_v4l2_encoder.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/v4l2_encoder.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_v4l2_encoder.c -o $@
 
 # 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
 gen:

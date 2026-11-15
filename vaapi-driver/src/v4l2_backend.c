@@ -22,6 +22,8 @@
 #endif
 
 #include "v4l2_backend.h"
+#include "sandbox_heap.h"
+#include "video_stats.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -210,6 +212,13 @@ static uint32_t ion_system_mask(int fd)
 static int heap_open(struct dmd_v4l2_dec *d)
 {
     if (d->heap_fd >= 0) return 0;
+
+    d->heap_fd = dmd_sandbox_system_heap_dup();
+    if (d->heap_fd >= 0) {
+        d->heap_kind = HEAP_DMA_HEAP;
+        V4L2_LOG("缓冲来源: preopened /dev/dma_heap/system");
+        return 0;
+    }
 
     d->heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
     if (d->heap_fd >= 0) {
@@ -1121,6 +1130,9 @@ static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
                (uint64_t)v.timestamp.tv_usec;
     *out_index = (int)v.index;
     if (v.flags & V4L2_BUF_FLAG_LAST) d->saw_eos = 1;
+    d->cap[v.index].hardware_error = (v.flags & V4L2_BUF_FLAG_ERROR) != 0;
+    if (d->cap[v.index].hardware_error) dmd_video_stats_error(d->video_stats);
+    else dmd_video_stats_hw(d->video_stats);
     return 1;
 }
 

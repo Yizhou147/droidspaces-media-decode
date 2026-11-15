@@ -2,11 +2,12 @@
 
 > 🌐 **English version: [README.en.md](README.en.md)**
 
-给 Linux 容器提供视频硬件解码：一个 VA-API 驱动，直连高通 msm_vidc 的 V4L2 接口。
+给 Linux 容器提供视频硬件解码与编码：一个 VA-API 驱动，直连高通 msm_vidc 的 V4L2 接口。
 
 ## 项目简介
 
-容器内的应用（ffmpeg、Firefox、Chrome）通过标准 VA-API 用上硬件解码，**无需任何改动**。
+容器内的应用（ffmpeg、Firefox、Chrome）通过标准 VA-API 调用驱动；浏览器还需
+对应的启动环境与沙箱设备兼容配置。
 驱动被 libva `dlopen` 进消费者进程，直接操作 `/dev/video32`。
 
 ```
@@ -50,6 +51,35 @@ AV1 需要 `-DDMD_ENABLE_AV1` 才会声明，MPEG-2 需要 `-DDMD_ENABLE_MPEG2`�
 只能回落软解，见 [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md)。
 
 ## 编译与安装
+
+Firefox 160 在 GNU/Linux AArch64 上可使用可选兼容库，保留 Mozilla 沙箱并为
+RDD 增加限定 KGSL ioctl 规则。它只在 RDD 预开所需设备，保护缓存 fd，明确拒绝
+exec 与 io_uring；不会启动 daemon。编译 `make -C vaapi-driver firefox-compat`，
+安装与 Gold 用户桌面入口见 [`doc/firefox-sandbox.md`](doc/firefox-sandbox.md)。
+仅 `about:support` 显示支持不能证明硬解，须同时核对实际硬件输出帧数。
+
+### 新增：V4L2 硬编码（0.5.0-dev）
+
+编码也在容器进程内直接调用 V4L2，默认节点 `/dev/video33`，**无需 daemon、
+Termux、MediaCodec 或定制 Mesa**。H.264 Constrained Baseline / Main / High、
+HEVC Main、VP9 Profile 0 的 `VAEntrypointEncSlice` 按设备实际格式和 profile
+探测结果声明；没有枚举到的编码器不会出现。编码节点可用
+`DMD_VA_ENCODE_DEVICE` 覆盖。
+
+当前支持 8bit NV12、CBR/VBR、I/P 帧、单参考与单 slice；使用 FFmpeg 时指定
+`-bf 0`。码率控制由硬件执行，HRD/VBV 是建议，不保证精确峰值或自定义 QP。
+参数变更需要重建编码 context。完整用法、设备权限与验证范围见
+[`doc/hardware-encoding.md`](doc/hardware-encoding.md)。
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
+  -i input.mp4 -vf format=nv12,hwupload -an \
+  -c:v h264_vaapi -bf 0 -g 30 -rc_mode CBR -b:v 6M output.mp4
+```
+
+安装方法与解码相同，仍只有一个 `.so`。
+
+### 构建
 
 必须在 **aarch64** 上编译（x86_64 交叉工具链缺 aarch64 glibc）：
 

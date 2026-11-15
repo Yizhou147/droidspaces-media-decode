@@ -36,8 +36,12 @@
 #include "driver.h"
 #include "av1_bitstream.h"
 #include "mpeg2_bitstream.h"
+#include "encode.h"
+#include "hevc_slice.h"
 
 static void dumb_sync_end_write(struct dmd_surface *s);
+static void encode_output_error_locked(struct dmd_driver *drv,
+                                       struct dmd_context *c, VAStatus status);
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
@@ -54,7 +58,7 @@ static int dmd_trace_order(void)
     }
     return cached;
 }
-static void surface_store_frame_locked(struct dmd_surface *s,
+static void surface_store_frame_locked(struct dmd_context *c, struct dmd_surface *s,
                                        const struct dmd_frame *f);
 
 unsigned int dmd_align_up(unsigned int v, unsigned int align)
@@ -103,6 +107,7 @@ struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv, VABufferID id)
 
 void dmd_surface_reset_locked(struct dmd_surface *s)
 {
+    dmd_import_unref(s->imported);
     if (s->exportable) {
         /* 同步用的 dmabuf fd 先关：它对 buffer 持有一份引用，
          * 留着会让 DESTROY_DUMB 之后内存仍不释放。
@@ -128,6 +133,11 @@ void dmd_surface_reset_locked(struct dmd_surface *s)
 
 void dmd_context_reset_locked(struct dmd_context *c)
 {
+    dmd_video_stats_close(c->video_stats);
+    dmd_video_stats_unref(c->video_stats);
+    c->video_stats = NULL;
+    if (c->encoder)
+        dmd_encode_destroy(c->encoder);
     /* session_destroy 会 close socket。它不阻塞（close 不等对端），
      * 所以在这里做是安全的。
      * ⚠️ 它在末尾 memset 整个 context，修复缓冲的释放必须在它**之前**。 */
@@ -211,6 +221,12 @@ static int io_release(struct dmd_driver *drv, int idx)
 {
     drv->io_busy[idx] = 0;
     pthread_cond_broadcast(&drv->io_done);
+
+    if (drv->encode_defer[idx]) {
+        struct dmd_encode *e = drv->encode_defer[idx];
+        drv->encode_defer[idx] = NULL;
+        dmd_encode_destroy(e);
+    }
 
     struct dmd_session *z = drv->io_defer[idx];
     if (!z) return 0;
@@ -303,7 +319,7 @@ static void *dmd_reaper_thread(void *arg)
                 VASurfaceID id = dmd_pending_take_locked(c, f.unit_seq);
                 struct dmd_surface *s = dmd_find_surface_locked(drv, id);
                 if (s) {
-                    surface_store_frame_locked(s, &f);
+                    surface_store_frame_locked(c, s, &f);
                     s->state = DMD_SURFACE_READY;
                     c->frames_out++;
                     worked = 1;
@@ -577,6 +593,8 @@ static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
     s->id = id;
     s->width = width;
     s->height = height;
+    s->visible_width = width;
+    s->visible_height = height;
     s->buf_width = bw;
     s->buf_height = bh;
     s->stride = stride;
@@ -670,6 +688,51 @@ VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height,
                                   surfaces, (unsigned int)num_surfaces);
 }
 
+static VAStatus create_imported_surfaces(VADriverContextP ctx, unsigned format,
+                                         unsigned width, unsigned height,
+                                         VASurfaceID *surfaces, unsigned count,
+                                         unsigned memory_type, const void *descriptors)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv || !surfaces || !descriptors || !count || count > DMD_MAX_SURFACES)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (format != VA_RT_FORMAT_YUV420)
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    if (width < DMD_MIN_WIDTH || height < DMD_MIN_HEIGHT ||
+        width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT || ((width | height) & 1))
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    /* PRIME v1 has one shared ExternalBuffers descriptor and a buffer array;
+     * only the single-buffer form used by Chromium is supported here. */
+    if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME && count != 1)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    for (unsigned i = 0; i < count; i++) surfaces[i] = VA_INVALID_ID;
+    pthread_mutex_lock(&drv->lock);
+    VAStatus status = VA_STATUS_SUCCESS;
+    unsigned made = 0;
+    for (; made < count; made++) {
+        struct dmd_surface *slot = NULL;
+        for (unsigned i = 0; i < DMD_MAX_SURFACES; i++)
+            if (!drv->surfaces[i].in_use) { slot = &drv->surfaces[i]; break; }
+        if (!slot) { status = VA_STATUS_ERROR_ALLOCATION_FAILED; break; }
+        const void *desc = memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 ?
+            (const VADRMPRIMESurfaceDescriptor *)descriptors + made : descriptors;
+        status = dmd_import_surface_init(slot, width, height, memory_type, desc);
+        if (status != VA_STATUS_SUCCESS) break;
+        slot->in_use = 1;
+        slot->id = drv->next_surface_id++;
+        surfaces[made] = slot->id;
+    }
+    if (status != VA_STATUS_SUCCESS)
+        for (unsigned i = 0; i < made; i++) {
+            dmd_surface_reset_locked(dmd_find_surface_locked(drv, surfaces[i]));
+            surfaces[i] = VA_INVALID_ID;
+        }
+    pthread_mutex_unlock(&drv->lock);
+    dmd_log("CreateSurfaces: imported 0x%x %ux%u n=%u status=0x%x\n",
+            memory_type, width, height, count, status);
+    return status;
+}
+
 VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
                              unsigned int width, unsigned int height,
                              VASurfaceID *surfaces, unsigned int num_surfaces,
@@ -684,6 +747,31 @@ VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
      * 2 字节/样本分配。 */
     if (num_attribs > 0 && !attrib_list)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    const void *external = NULL;
+    int have_memory_type = 0, have_external = 0;
+    for (unsigned i = 0; i < num_attribs; i++) {
+        if (attrib_list[i].type == VASurfaceAttribMemoryType) {
+            if (have_memory_type++ || attrib_list[i].value.type != VAGenericValueTypeInteger)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            memory_type = (unsigned)attrib_list[i].value.value.i;
+        } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
+            if (have_external++ || attrib_list[i].value.type != VAGenericValueTypePointer)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            external = attrib_list[i].value.value.p;
+        }
+    }
+    if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME ||
+        memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        for (unsigned i = 0; i < num_attribs; i++)
+            if (attrib_list[i].type == VASurfaceAttribPixelFormat &&
+                (attrib_list[i].value.type != VAGenericValueTypeInteger ||
+                 attrib_list[i].value.value.i != VA_FOURCC_NV12))
+                return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        return create_imported_surfaces(ctx, format, width, height, surfaces,
+                                         num_surfaces, memory_type, external);
+    }
 
     for (unsigned int i = 0; i < num_attribs; i++) {
         if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
@@ -713,6 +801,21 @@ VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
                                   num_surfaces);
 }
 
+/* A derived image borrows this allocation. An outstanding map or external
+ * handle locks pixels; even an unmapped image must retain valid storage until
+ * DestroyImage. Callers hold the object lock. */
+static int surface_images_locked(struct dmd_driver *drv, VASurfaceID surface,
+                                  int active_only)
+{
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface &&
+            (!active_only || img->mapped || img->handle_acquired))
+            return 1;
+    }
+    return 0;
+}
+
 VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
                              int num_surfaces)
 {
@@ -731,6 +834,10 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
             /* 继续销毁其余的：半途返回会泄漏后面那些。
              * 但仍要把错误报上去，调用方有 bug 该知道。 */
             status = VA_STATUS_ERROR_INVALID_SURFACE;
+            continue;
+        }
+        if (surface_images_locked(drv, s->id, 0)) {
+            status = VA_STATUS_ERROR_SURFACE_BUSY;
             continue;
         }
         dmd_surface_reset_locked(s);
@@ -859,6 +966,7 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     }
 
     c->session = ns;
+    dmd_session_set_video_stats(ns, c->video_stats);
     c->retiring = 0;
     c->input_finished = 0;
     /* 新会话的 daemon 侧 vcl_in 从 1 重新开始，这里必须同步归零，
@@ -954,7 +1062,7 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     }
 
     for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
-        if (!drv->contexts[i].in_use) {
+        if (!drv->contexts[i].in_use && !drv->io_busy[i]) {
             slot_idx = i;
             break;
         }
@@ -971,11 +1079,31 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     c->id = (VAContextID)(drv->next_context_id++);
     c->config_id = config_id;
     c->profile = profile;
+    c->entrypoint = cfg->entrypoint;
     c->codec = codec;
     c->picture_width = (unsigned int)picture_width;
     c->picture_height = (unsigned int)picture_height;
     c->flag = flag;
     c->current_target = VA_INVALID_ID;
+
+    c->video_stats = dmd_video_stats_create(c->id, cfg->entrypoint == VAEntrypointEncSlice,
+                                            codec, (int)profile, DMD_VENDOR_STRING);
+    if (cfg->entrypoint == VAEntrypointEncSlice) {
+        unsigned rc = VA_RC_VBR;
+        for (int i = 0; i < cfg->num_attribs; i++)
+            if (cfg->attribs[i].type == VAConfigAttribRateControl)
+                rc = cfg->attribs[i].value;
+        c->encoder = dmd_encode_create(profile, picture_width, picture_height, rc);
+        if (!c->encoder) {
+            dmd_context_reset_locked(c);
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        dmd_encode_set_video_stats(c->encoder, c->video_stats);
+        *context = c->id;
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
 
     VAContextID new_id = c->id;
     pthread_mutex_unlock(&drv->lock);
@@ -1000,6 +1128,8 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     c->session = sess;
+    dmd_session_set_video_stats(sess, c->video_stats);
+    if (!sess) dmd_video_stats_error(c->video_stats);
     /* 会话建不起来不让 CreateContext 失败：daemon 可能只是暂时不可用，
      * 首次 EndPicture 会重试。失败时报的错更贴近真实原因。 */
     c->session_failed = sess ? 0 : 1;
@@ -1069,6 +1199,13 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
         dmd_log("DestroyContext: 等 IO 交还超时（%d ms），会话改为延后销毁\n",
                 DMD_FRAME_TIMEOUT_MS);
 
+    /* Encoding works on owned pixel/packet snapshots while the lock is free.
+     * If its bounded IO has not returned yet, the last user owns destruction. */
+    if (c->encoder && io_stuck) {
+        drv->encode_defer[idx] = c->encoder;
+        c->encoder = NULL;
+    }
+
     /* 从此刻起收帧线程不再碰本 context 的会话（它见到 retiring 就跳过）。 */
     c->retiring = 1;
 
@@ -1121,7 +1258,7 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
                 VASurfaceID id = dmd_pending_take_locked(c, frame.unit_seq);
                 struct dmd_surface *ds = dmd_find_surface_locked(drv, id);
                 if (ds) {
-                    surface_store_frame_locked(ds, &frame);
+                    surface_store_frame_locked(c, ds, &frame);
                     ds->state = DMD_SURFACE_READY;
                     drained++;
                 }
@@ -1236,6 +1373,11 @@ VAStatus dmd_CreateBuffer(VADriverContextP ctx, VAContextID context,
     slot->num_elements = num_elements;
     slot->size = total;
     slot->data = mem;
+    if (type == VAEncCodedBufferType) {
+        slot->coded_segment.buf = mem;
+        slot->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+        slot->coded_status = VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
     *buf_id = slot->id;
     pthread_mutex_unlock(&drv->lock);
@@ -1257,7 +1399,7 @@ VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
-    if (b->mapped) {
+    if (b->mapped || b->coded_pending) {
         /* 映射中改大小会让调用方手上的指针失效。 */
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -1282,13 +1424,20 @@ VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
     if (status == VA_STATUS_SUCCESS) {
         b->num_elements = num_elements;
         b->size = total;
+        if (b->type == VAEncCodedBufferType) {
+            b->coded_segment.buf = b->data;
+            b->coded_segment.size = 0;
+            b->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+            b->coded_status = VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
     pthread_mutex_unlock(&drv->lock);
 
     return status;
 }
 
-VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
+static VAStatus map_buffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf,
+                            unsigned flags)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
 
@@ -1296,10 +1445,24 @@ VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     *pbuf = NULL;
+    if (flags & ~(VA_MAPBUFFER_FLAG_READ | VA_MAPBUFFER_FLAG_WRITE))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!flags)
+        flags = VA_MAPBUFFER_FLAG_READ | VA_MAPBUFFER_FLAG_WRITE;
 
     pthread_mutex_lock(&drv->lock);
     struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
     if (b) {
+        if (b->type == VAEncCodedBufferType) {
+            if (b->coded_pending) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_HW_BUSY;
+            }
+            b->mapped++;
+            *pbuf = &b->coded_segment;
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
         b->mapped++;
         *pbuf = b->data;
         pthread_mutex_unlock(&drv->lock);
@@ -1319,11 +1482,62 @@ VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
+    if (img->handle_acquired) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (img->derived_from != VA_INVALID_ID) {
+        struct dmd_surface *parent = dmd_find_surface_locked(drv, img->derived_from);
+        if (!parent || img->data != parent->data ||
+            img->data_size > parent->data_size ||
+            img->image.pitches[0] != parent->stride ||
+            img->image.offsets[1] != (uint64_t)parent->stride * parent->slice_height ||
+            img->image.width != parent->width || img->image.height != parent->height) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+        if (parent->state == DMD_SURFACE_PENDING ||
+            surface_images_locked(drv, parent->id, 1)) {
+            /* Multiple maps of this same image retain the existing API's
+             * reference count; other active derived views cannot overlap. */
+            int others = 0;
+            for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+                struct dmd_image *other = &drv->images[i];
+                if (other != img && other->in_use &&
+                    other->derived_from == parent->id &&
+                    (other->mapped || other->handle_acquired))
+                    others = 1;
+            }
+            if (parent->state == DMD_SURFACE_PENDING || others) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_SURFACE_BUSY;
+            }
+        }
+        if (!img->mapped && parent->exportable && parent->dumb_sync_fd >= 0) {
+            /* A legacy MapBuffer may read and write. Use one matching RW
+             * cache transaction for all nested maps; flags still determine
+             * whether the final unmap commits an uploaded image. */
+            struct dma_buf_sync sync = {
+                .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE
+            };
+            if (ioctl(parent->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            img->map_sync_started = 1;
+        }
+    }
+    img->map_flags |= flags;
     img->mapped++;
     *pbuf = img->data;
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
+{
+    return map_buffer(ctx, buf_id, pbuf, VA_MAPBUFFER_FLAG_DEFAULT);
 }
 
 /* vaMapBuffer2 = vaMapBuffer + 读写意图提示。
@@ -1334,12 +1548,50 @@ VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
  * 就直接失败，永远走不到 vaMapBuffer 那条兼容分支。
  * 这是"填满 vtable"与"libva 靠 NULL 判断能力"之间的一个真实冲突。
  *
- * flags 对我们无意义：后备存储是普通 heap 内存，读写都是直接访问。 */
+ * Direct surface uploads commit only after a successful WRITE unmap. */
+VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    /* Match the driver's bounded hardware waits, including VA_TIMEOUT_INFINITE. */
+    const uint64_t limit = (uint64_t)DMD_FRAME_TIMEOUT_MS * 1000000ULL;
+    if (timeout_ns > limit)
+        timeout_ns = limit;
+    deadline.tv_sec += (time_t)(timeout_ns / 1000000000ULL);
+    deadline.tv_nsec += (long)(timeout_ns % 1000000000ULL);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&drv->lock);
+    VAStatus status;
+    for (;;) {
+        struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+        if (!b || b->type != VAEncCodedBufferType) {
+            status = VA_STATUS_ERROR_INVALID_BUFFER;
+            break;
+        }
+        if (!b->coded_pending) {
+            status = b->coded_status;
+            break;
+        }
+        if (timeout_ns == 0 ||
+            pthread_cond_timedwait(&drv->io_done, &drv->lock, &deadline) == ETIMEDOUT) {
+            status = VA_STATUS_ERROR_TIMEDOUT;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+    return status;
+}
+
 VAStatus dmd_MapBuffer2(VADriverContextP ctx, VABufferID buf_id, void **pbuf,
                         uint32_t flags)
 {
-    (void)flags;
-    return dmd_MapBuffer(ctx, buf_id, pbuf);
+    return map_buffer(ctx, buf_id, pbuf, flags);
 }
 
 VAStatus dmd_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
@@ -1361,10 +1613,43 @@ VAStatus dmd_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
     for (int i = 0; i < DMD_MAX_IMAGES; i++) {
         struct dmd_image *img = &drv->images[i];
         if (img->in_use && img->buf_id == buf_id) {
-            if (img->mapped > 0)
-                img->mapped--;
+            if (img->handle_acquired) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_SURFACE_BUSY;
+            }
+            VAStatus status = VA_STATUS_SUCCESS;
+            if (img->mapped == 1 && img->derived_from != VA_INVALID_ID) {
+                struct dmd_surface *parent = dmd_find_surface_locked(drv, img->derived_from);
+                if (!parent || parent->data != img->data) {
+                    status = VA_STATUS_ERROR_INVALID_BUFFER;
+                } else {
+                    if (img->map_sync_started) {
+                        struct dma_buf_sync sync = {
+                            .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE
+                        };
+                        if (parent->dumb_sync_fd < 0 ||
+                            ioctl(parent->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0)
+                            status = VA_STATUS_ERROR_OPERATION_FAILED;
+                    }
+                    if (img->map_flags & VA_MAPBUFFER_FLAG_WRITE) {
+                        /* CPU upload supplies valid pixels, not a completed
+                         * hardware decode. Do not update hardware telemetry. */
+                        parent->decode_status = status;
+                        parent->state = status == VA_STATUS_SUCCESS ?
+                            DMD_SURFACE_READY : DMD_SURFACE_IDLE;
+                        parent->context = VA_INVALID_ID;
+                        parent->visible_x = parent->visible_y = 0;
+                        parent->visible_width = parent->width;
+                        parent->visible_height = parent->height;
+                    }
+                }
+            }
+            if (img->mapped > 0 && !--img->mapped) {
+                img->map_flags = 0;
+                img->map_sync_started = 0;
+            }
             pthread_mutex_unlock(&drv->lock);
-            return VA_STATUS_SUCCESS;
+            return status;
         }
     }
     pthread_mutex_unlock(&drv->lock);
@@ -1454,6 +1739,14 @@ static int slice_append_locked(struct dmd_context *c, const void *data,
     return 0;
 }
 
+static int surface_is_external_encode_input(const struct dmd_surface *s)
+{
+    return s->state == DMD_SURFACE_IDLE && s->external_write_exported &&
+           s->exportable && s->dumb_sync_fd >= 0 && !s->imported &&
+           s->decode_status == VA_STATUS_SUCCESS &&
+           s->format == VA_RT_FORMAT_YUV420;
+}
+
 VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
                           VASurfaceID render_target)
 {
@@ -1472,6 +1765,71 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
     if (!s) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    if (surface_images_locked(drv, render_target, 1)) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+
+    if (c->encoder) {
+        if (drv->io_busy[c - drv->contexts]) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_HW_BUSY;
+        }
+        VAStatus status;
+        if (!surface_is_external_encode_input(s)) {
+            pthread_mutex_unlock(&drv->lock);
+            status = dmd_surface_wait(drv, render_target);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+            pthread_mutex_lock(&drv->lock);
+            c = dmd_find_context_locked(drv, context);
+            s = dmd_find_surface_locked(drv, render_target);
+            if (!c || !c->encoder || !s) {
+                pthread_mutex_unlock(&drv->lock);
+                return !c ? VA_STATUS_ERROR_INVALID_CONTEXT : VA_STATUS_ERROR_INVALID_SURFACE;
+            }
+            if (drv->io_busy[c - drv->contexts]) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_HW_BUSY;
+            }
+            if (surface_images_locked(drv, render_target, 1)) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_SURFACE_BUSY;
+            }
+            /* Waiting releases the lock: a new submission or failed decode
+             * may have changed the same surface before we reacquired it. */
+            if (s->decode_status != VA_STATUS_SUCCESS) {
+                status = s->decode_status;
+                pthread_mutex_unlock(&drv->lock);
+                return status;
+            }
+            if (s->state != DMD_SURFACE_READY &&
+                !surface_is_external_encode_input(s)) {
+                status = s->state == DMD_SURFACE_PENDING ?
+                    VA_STATUS_ERROR_SURFACE_BUSY : VA_STATUS_ERROR_INVALID_SURFACE;
+                pthread_mutex_unlock(&drv->lock);
+                return status;
+            }
+        }
+        /* WRITE export lets an application supply a fresh NV12 texture without
+         * a decode/PutImage submission. The application finishes GPU commands;
+         * EndPicture still brackets its CPU snapshot with DMA_BUF_SYNC_READ. */
+        if (s->format != VA_RT_FORMAT_YUV420) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        }
+        status = dmd_encode_begin(c->encoder, render_target);
+        if (status == VA_STATUS_SUCCESS)
+            c->current_target = render_target;
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+
+    if (s->imported) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNIMPLEMENTED; /* imported surfaces are read-only inputs */
     }
 
     /* 上一帧没 EndPicture 就又 Begin：丢掉残留数据，否则会拼进新帧。 */
@@ -1493,6 +1851,8 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
     c->av1_tile_count = 0;   /* tile 边界随帧重置，与 slice_len 同生命周期 */
     c->have_vp8_slice_param = 0;
     c->have_vp8_pic_param = 0;
+    c->hevc_slice_count = c->hevc_slices_bound = 0;
+    c->hevc_slice_error = 0;
     /* MPEG-2 的 pic param / IQ matrix 是逐帧下发的，与 slice_len 同生命周期。
      * mpeg2_seq_sent / mpeg2_temporal_ref 是**跨帧**状态，不能在这里清。 */
     c->have_mpeg2_pic_param = 0;
@@ -1527,6 +1887,34 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
         return VA_STATUS_ERROR_INVALID_CONTEXT; /* 没 BeginPicture */
     }
 
+    if (c->encoder) {
+        if (drv->io_busy[c - drv->contexts]) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_HW_BUSY;
+        }
+        VAStatus status = VA_STATUS_SUCCESS;
+        for (int i = 0; i < num_buffers; i++) {
+            struct dmd_buffer *b = dmd_find_buffer_locked(drv, buffers[i]);
+            if (!b || b->context != context) {
+                status = VA_STATUS_ERROR_INVALID_BUFFER;
+                encode_output_error_locked(drv, c, status);
+                dmd_encode_abort(c->encoder);
+                c->current_target = VA_INVALID_ID;
+                break;
+            }
+            status = dmd_encode_render(c->encoder, b->type, b->data,
+                                       b->element_size, b->num_elements);
+            if (status != VA_STATUS_SUCCESS) {
+                dmd_log("Encode RenderPicture: type=%d size=%u status=0x%x\n",
+                        b->type, b->element_size, status);
+                encode_output_error_locked(drv, c, status);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+
     VAStatus status = VA_STATUS_SUCCESS;
 
     for (int i = 0; i < num_buffers; i++) {
@@ -1537,17 +1925,43 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
         }
 
         switch (b->type) {
-        case VASliceDataBufferType:
+        case VASliceDataBufferType: {
             /* 这里是真正的码流。
              * VP9：整帧（含 uncompressed header，从 frame_marker 起），原样转发
              * VP8：partition 0 起，缺 RFC 6386 §9.1 的 uncompressed chunk
              * H.264/HEVC：slice NALU 的**载荷**，不含起始码 */
+            size_t base = c->slice_len;
             if (slice_append_locked(c, b->data, b->size) != 0) {
                 status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            } else if (c->codec == DMD_CODEC_HEVC) {
+                if (c->hevc_slices_bound == c->hevc_slice_count)
+                    c->hevc_slice_error = 1; /* long-format boundaries missing */
+                for (unsigned j = c->hevc_slices_bound; j < c->hevc_slice_count; ++j) {
+                    const VASliceParameterBufferHEVC *sp = &c->hevc_slice_param[j];
+                    if (sp->slice_data_offset > b->size ||
+                        sp->slice_data_size > b->size - sp->slice_data_offset)
+                        c->hevc_slice_error = 1;
+                    else c->hevc_slice_offset[j] = base + sp->slice_data_offset;
+                }
+                c->hevc_slices_bound = c->hevc_slice_count;
             }
             break;
+        }
 
         case VASliceParameterBufferType:
+            if (c->codec == DMD_CODEC_HEVC) {
+                if (b->element_size < sizeof(VASliceParameterBufferHEVC) ||
+                    b->num_elements > 128 - c->hevc_slice_count) {
+                    c->hevc_slice_error = 1;
+                    break;
+                }
+                for (unsigned j = 0; j < b->num_elements; ++j) {
+                    memcpy(&c->hevc_slice_param[c->hevc_slice_count++],
+                           (const uint8_t *)b->data + (size_t)j * b->element_size,
+                           sizeof(VASliceParameterBufferHEVC));
+                }
+                break;
+            }
             /* AV1：每个 tile 一份 slice param（va_dec_av1.h:635），
              * 它是 tile 边界的唯一可靠来源 —— slice data 可能整帧打包在
              * 一个 buffer 里，数追加次数会得到 1 而非真实 tile 数。
@@ -2458,10 +2872,30 @@ static const unsigned char *build_unit(struct dmd_context *c,
      *   以及 1088 对齐高度裁回 1080 时 COMPOSE 选区是否漏了色度面。
      */
     case DMD_CODEC_HEVC: {
-        /* 与 H.264 完全同构：VASliceParameterBufferHEVC 里有
-         * slice_data_byte_offset，说明 slice header 原样在 buffer 里，
-         * 所以只需前置 4 字节起始码转发，不必重建 slice header
-         * （那要反推参考列表重排序，是欠定问题）。 */
+        if (c->hevc_pic_param_valid && c->hevc_pic_param.num_short_term_ref_pic_sets) {
+            if (!dmd_hevc_can_build(&c->hevc_pic_param) || c->hevc_slice_error ||
+                !c->hevc_slice_count || c->hevc_slices_bound != c->hevc_slice_count ||
+                c->slice_len > (SIZE_MAX - (size_t)c->hevc_slice_count * 2048) / 2) {
+                dmd_log("HEVC RPS: unsupported picture or missing long slice boundaries\n");
+                return NULL;
+            }
+            size_t cap = c->slice_len * 2 + (size_t)c->hevc_slice_count * 2048;
+            uint8_t *buf = malloc(cap);
+            if (!buf) return NULL;
+            size_t total = 0;
+            if (dmd_hevc_rewrite_slices(&c->hevc_pic_param, c->hevc_slice_param,
+                    c->hevc_slice_offset, c->hevc_slice_count, c->slice_data,
+                    c->slice_len, buf, cap, &total) < 0) {
+                dmd_log("HEVC RPS: slice rewrite rejected: %s\n", strerror(errno));
+                free(buf);
+                return NULL;
+            }
+            *scratch = buf;
+            *out_len = total;
+            return buf;
+        }
+        /* No SPS-resident ST sets: keep the existing inline-RPS forwarding
+         * path. The original slice header and CABAC bytes are already present. */
         size_t cap = 4 + c->slice_len;
         unsigned char *buf = malloc(cap);
         if (!buf)
@@ -2603,7 +3037,143 @@ static int dmd_pending_has_exported_locked(struct dmd_driver *drv,
     return 0;
 }
 
-VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
+/* Called with drv->lock held. Encoding may wait for firmware, so it uses owned
+ * snapshots outside the object-table lock. Neither DestroyBuffer nor context
+ * teardown can invalidate memory used by the in-flight ioctl path. */
+static void encode_output_error_locked(struct dmd_driver *drv,
+                                       struct dmd_context *c, VAStatus status)
+{
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv,
+                                 dmd_encode_coded_buffer(c->encoder));
+    if (b && b->context == c->id && b->type == VAEncCodedBufferType &&
+        !b->mapped && !b->coded_pending) {
+        memset(&b->coded_segment, 0, sizeof(b->coded_segment));
+        b->coded_segment.buf = b->data;
+        b->coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+        b->coded_status = status;
+    }
+}
+
+static VAStatus encode_abort_locked(struct dmd_driver *drv, struct dmd_context *c,
+                                     VAStatus status)
+{
+    encode_output_error_locked(drv, c, status);
+    dmd_encode_abort(c->encoder);
+    c->current_target = VA_INVALID_ID;
+    return status;
+}
+
+static VAStatus encode_end_locked(struct dmd_driver *drv, struct dmd_context *c)
+{
+    const VAContextID context = c->id;
+    const int idx = (int)(c - drv->contexts);
+    if (drv->io_busy[idx])
+        return VA_STATUS_ERROR_HW_BUSY;
+    struct dmd_surface *source = dmd_find_surface_locked(drv, c->current_target);
+    VABufferID bid = dmd_encode_coded_buffer(c->encoder);
+    struct dmd_buffer *coded = dmd_find_buffer_locked(drv, bid);
+    if (!source)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_INVALID_SURFACE);
+    if (surface_images_locked(drv, source->id, 1))
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_SURFACE_BUSY);
+    if (bid == VA_INVALID_ID) {
+        VAStatus status = dmd_encode_end(c->encoder, NULL, NULL);
+        c->current_target = VA_INVALID_ID;
+        return status;
+    }
+    if (!coded || coded->context != context || coded->type != VAEncCodedBufferType)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_INVALID_BUFFER);
+    if (coded->mapped || coded->coded_pending)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_HW_BUSY);
+    if (source->state == DMD_SURFACE_PENDING)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_HW_BUSY);
+
+    struct dmd_surface snapshot = *source;
+    if (source->visible_x || source->visible_y)
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_UNIMPLEMENTED);
+    if (source->visible_width)
+        snapshot.width = source->visible_width;
+    if (source->visible_height)
+        snapshot.height = source->visible_height;
+    snapshot.data = malloc(source->data_size);
+    struct dmd_buffer result = *coded;
+    result.data = malloc(coded->size);
+    if (!snapshot.data || !result.data) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_ALLOCATION_FAILED);
+    }
+    const int needs_sync = source->exportable && source->dumb_sync_fd >= 0;
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    if (needs_sync && ioctl(source->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_OPERATION_FAILED);
+    }
+    if (!source->imported)
+        memcpy(snapshot.data, source->data, source->data_size);
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    int sync_error = needs_sync &&
+        ioctl(source->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0;
+    snapshot.exportable = 0;
+    snapshot.dumb_sync_fd = -1;
+    if (sync_error) {
+        free(snapshot.data);
+        free(result.data);
+        return encode_abort_locked(drv, c, VA_STATUS_ERROR_OPERATION_FAILED);
+    }
+    memset(&result.coded_segment, 0, sizeof(result.coded_segment));
+    result.coded_segment.buf = result.data;
+    struct dmd_encode *encoder = c->encoder;
+    c->current_target = VA_INVALID_ID;
+    coded->coded_pending = 1;
+    coded->coded_status = VA_STATUS_ERROR_HW_BUSY;
+    memset(&coded->coded_segment, 0, sizeof(coded->coded_segment));
+    coded->coded_segment.buf = coded->data;
+    drv->io_busy[idx] = 1;
+    dmd_import_ref(snapshot.imported);
+
+    pthread_mutex_unlock(&drv->lock);
+    VAStatus status = snapshot.imported ?
+        dmd_import_copy(&snapshot, snapshot.data, snapshot.data_size) : VA_STATUS_SUCCESS;
+    dmd_import_unref(snapshot.imported);
+    snapshot.imported = NULL;
+    if (status == VA_STATUS_SUCCESS) {
+        status = dmd_encode_end(encoder, &snapshot, &result);
+    } else {
+        dmd_encode_abort(encoder);
+        result.coded_segment.status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
+    }
+    free(snapshot.data);
+    pthread_mutex_lock(&drv->lock);
+
+    c = dmd_find_context_locked(drv, context);
+    coded = dmd_find_buffer_locked(drv, bid);
+    if (c && coded && coded->context == context) {
+        if (status == VA_STATUS_SUCCESS && result.coded_segment.size <= coded->size) {
+            memcpy(coded->data, result.data, result.coded_segment.size);
+            coded->coded_segment = result.coded_segment;
+            coded->coded_segment.buf = coded->data;
+            coded->coded_segment.next = NULL;
+        } else {
+            if (status == VA_STATUS_SUCCESS)
+                status = VA_STATUS_ERROR_NOT_ENOUGH_BUFFER;
+            coded->coded_segment.size = 0;
+            coded->coded_segment.status = result.coded_segment.status;
+        }
+        coded->coded_status = status;
+        coded->coded_pending = 0;
+        if (status == VA_STATUS_SUCCESS)
+            dmd_video_stats_output(c->video_stats, 0);
+    } else {
+        status = c ? VA_STATUS_ERROR_INVALID_BUFFER : VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    free(result.data);
+    io_release(drv, idx);
+    return status;
+}
+
+static VAStatus end_picture(VADriverContextP ctx, VAContextID context)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
 
@@ -2619,6 +3189,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (c->current_target == VA_INVALID_ID) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    if (c->encoder) {
+        VAStatus status = encode_end_locked(drv, c);
+        pthread_mutex_unlock(&drv->lock);
+        return status;
     }
 
     VASurfaceID target = c->current_target;
@@ -2797,6 +3373,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             if (s) {
                 s->state = DMD_SURFACE_READY;
                 s->decode_status = VA_STATUS_SUCCESS;
+                dmd_video_stats_reuse(c->video_stats);
             }
             c->current_target = VA_INVALID_ID;
             c->slice_len = 0;
@@ -2809,6 +3386,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             s->state = DMD_SURFACE_IDLE;
             s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;
         }
+        dmd_video_stats_error(c->video_stats);
         c->current_target = VA_INVALID_ID;
         c->slice_len = 0;
         c->av1_tile_count = 0;
@@ -2905,6 +3483,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         }
         if (!c->session) {
             c->session = retry;
+            dmd_session_set_video_stats(retry, c->video_stats);
             c->session_failed = retry ? 0 : 1;
         } else if (retry) {
             dmd_session_destroy(retry); /* 别的线程先建好了 */
@@ -3024,7 +3603,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 struct dmd_surface *bp_hs = dmd_find_surface_locked(drv,
                                                                     bp_head);
                 if (bp_hs) {
-                    surface_store_frame_locked(bp_hs, &bp_frame);
+                    surface_store_frame_locked(c, bp_hs, &bp_frame);
                     bp_hs->state = DMD_SURFACE_READY;
                 } else {
                     dmd_log("EndPicture 排空: 待配对 surface %u 已销毁，"
@@ -3206,6 +3785,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              * （av1_carry_dpb / av1_carry_blank）已随本块一并删除。 */
             ns->state = DMD_SURFACE_READY;
             ns->decode_status = VA_STATUS_SUCCESS;
+            dmd_video_stats_reuse(c->video_stats);
         }
         dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队\n",
                 (unsigned)c->av1_send_surface);
@@ -3274,7 +3854,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             VASurfaceID got = dmd_pending_take_locked(c, rf.unit_seq);
             struct dmd_surface *gs = dmd_find_surface_locked(drv, got);
             if (gs) {
-                surface_store_frame_locked(gs, &rf);
+                surface_store_frame_locked(c, gs, &rf);
                 gs->state = DMD_SURFACE_READY;
             }
             dmd_session_release_frame(ds, &rf);
@@ -3393,6 +3973,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     /* 拷一份码流到局部缓冲：放锁后 c->slice_data 可能被别的线程复用。 */
     unsigned char *tx = scratch;
+    scratch = NULL; /* 所有权转交 tx；后续退出只能释放 tx，不能再释放同一指针。 */
     if (!tx) {
         tx = malloc(unit_len);
         if (!tx) {
@@ -3415,6 +3996,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * = 下一个拆会话的人以为没人用了。实测签名是 QBUF/DMA_BUF_SYNC 报
      * ENOTTY，Chrome 侧 "Crashing due to FD ownership violation"。 */
     if (io_acquire(drv, idx, "EndPicture/送单元") < 0) {
+        /* 等待期间会放锁：原 context 可能已经销毁，不能改新槽位的队列。 */
+        if (!context_slot_ok(c, context)) {
+            pthread_mutex_unlock(&drv->lock);
+            free(tx);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
         /* 拿不到所有权：这一帧不能送。已登记的队列项要摘回去，
          * 否则留个永远配不上的空洞，其后每帧都落到顺序推断。 */
         if (c->pending_count > 0)
@@ -3427,7 +4014,6 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->current_target = VA_INVALID_ID;
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     if (!context_slot_ok(c, context)) {
@@ -3437,12 +4023,10 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         io_release(drv, idx);
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     sess = c->session;
     if (!sess) {
-        io_release(drv, idx);
         if (c->pending_count > 0)
             c->pending_count--;
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
@@ -3451,9 +4035,10 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
         }
         c->current_target = VA_INVALID_ID;
+        /* 交还可能销毁延后的会话；全部 context/surface 清理须先完成。 */
+        io_release(drv, idx);
         pthread_mutex_unlock(&drv->lock);
         free(tx);
-        free(scratch);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
@@ -3597,15 +4182,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             dmd_log("HEVC: 该码流无法合成参数集"
                     "（num_short_term_ref_pic_sets=%u），拒绝\n",
                     c->hevc_pic_param.num_short_term_ref_pic_sets);
-            /* tx 在上面已分配（scratch 为空时 malloc），这条早退路径必须
-             * 释放它 —— 否则每帧泄漏 unit_len 字节。函数正常路径在下面
-             * 统一 free(tx)，走不到这里。
-             *
-             * 注意 tx 可能就是 scratch（所有权已转移给 tx），所以只 free
-             * 一次、不要另外 free(scratch)。 */
-            free(tx);
-            c->pending_count--;
+            if (c->pending_count > 0)
+                c->pending_count--;
+            struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+            if (s) {
+                s->state = DMD_SURFACE_IDLE;
+                s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;
+            }
+            dmd_video_stats_error(c->video_stats);
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            c->av1_tile_count = 0;
+            /* 本函数已经取得 IO 所有权。拒绝也必须交还，否则下一帧
+             * 永远等它；交还可能销毁延后会话，之后不再访问 c/sess。 */
+            io_release(drv, idx);
             pthread_mutex_unlock(&drv->lock);
+            free(tx);
             return VA_STATUS_ERROR_UNIMPLEMENTED;
         }
         if (!c->param_sets_sent || c->sent_mbs_wide != w ||
@@ -3935,7 +4527,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             VASurfaceID hid = dmd_pending_take_locked(c, hf.unit_seq);
             struct dmd_surface *hs = dmd_find_surface_locked(drv, hid);
             if (hs) {
-                surface_store_frame_locked(hs, &hf);
+                surface_store_frame_locked(c, hs, &hf);
                 hs->state = DMD_SURFACE_READY;
                 harvested++;
             }
@@ -3953,6 +4545,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    struct dmd_video_stats *stats = NULL;
+    if (drv) {
+        pthread_mutex_lock(&drv->lock);
+        struct dmd_context *c = dmd_find_context_locked(drv, context);
+        if (c) stats = dmd_video_stats_ref(c->video_stats);
+        pthread_mutex_unlock(&drv->lock);
+    }
+    VAStatus status = end_picture(ctx, context);
+    if (status != VA_STATUS_SUCCESS) dmd_video_stats_error(stats);
+    dmd_video_stats_unref(stats);
+    return status;
 }
 
 /* ============================ 帧取回（Sync 路径） ============================ */
@@ -4208,9 +4816,23 @@ static void store_clipped_locked(struct dmd_surface *s, const struct dmd_frame *
     dumb_sync_end_write(s);
 }
 
-static void surface_store_frame_locked(struct dmd_surface *s,
+static void surface_store_frame_data_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
+    s->visible_x = s->visible_y = 0;
+    s->visible_width = s->width;
+    s->visible_height = s->height;
+    if (f->crop_left >= 0 && f->crop_top >= 0 &&
+        f->crop_right >= f->crop_left && f->crop_bottom >= f->crop_top &&
+        (unsigned)f->crop_right < f->width &&
+        (unsigned)f->crop_bottom < f->height) {
+        unsigned w = (unsigned)(f->crop_right - f->crop_left + 1);
+        unsigned h = (unsigned)(f->crop_bottom - f->crop_top + 1);
+        s->visible_x = (unsigned)f->crop_left;
+        s->visible_y = (unsigned)f->crop_top;
+        s->visible_width = w < s->width ? w : s->width;
+        s->visible_height = h < s->height ? h : s->height;
+    }
     /* 诊断：daemon 送来的帧本身是不是黑的？
      * 与 export.c 里的同名探测配对使用，用来区分
      * "解码器就输出了黑帧" 和 "拷进 surface 后才变黑"。
@@ -4314,6 +4936,18 @@ static void surface_store_frame_locked(struct dmd_surface *s,
 
     surf_dump_store(s, (unsigned)f->unit_seq);
     s->decode_status = VA_STATUS_SUCCESS;
+}
+
+static void surface_store_frame_locked(struct dmd_context *c, struct dmd_surface *s,
+                                       const struct dmd_frame *f)
+{
+    surface_store_frame_data_locked(s, f);
+    if (s->decode_status == VA_STATUS_SUCCESS) {
+        dmd_video_stats_decoded(c->video_stats, s->visible_width, s->visible_height,
+                                 f->hardware_error);
+    } else {
+        dmd_video_stats_error(c->video_stats);
+    }
 }
 
 /* 从 daemon 取帧直到目标 surface 就绪或超时。
@@ -4805,7 +5439,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
                 c->frames_out++;  /* 诊断计数：本会话已交付的帧数 */
                 struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
                 if (hs) {
-                    surface_store_frame_locked(hs, &frame);
+                    surface_store_frame_locked(c, hs, &frame);
                     hs->state = DMD_SURFACE_READY;
                 } else {
                     dmd_log("SyncSurface: 待配对 surface %u 已销毁，帧被丢弃\n",
@@ -4943,7 +5577,7 @@ VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target)
                             (uint64_t)DMD_FRAME_TIMEOUT_MS * 1000000ULL);
 }
 
-VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
+static VAStatus sync_surface2(VADriverContextP ctx, VASurfaceID surface,
                           uint64_t timeout_ns)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
@@ -5086,6 +5720,23 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
     }
     pthread_mutex_unlock(&drv->lock);
 
+    return status;
+}
+
+VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface, uint64_t timeout_ns)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    struct dmd_video_stats *stats = NULL;
+    if (drv) {
+        pthread_mutex_lock(&drv->lock);
+        struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
+        struct dmd_context *c = s ? dmd_find_context_locked(drv, s->context) : NULL;
+        if (c) stats = dmd_video_stats_ref(c->video_stats);
+        pthread_mutex_unlock(&drv->lock);
+    }
+    VAStatus status = sync_surface2(ctx, surface, timeout_ns);
+    if (status != VA_STATUS_SUCCESS) dmd_video_stats_error(stats);
+    dmd_video_stats_unref(stats);
     return status;
 }
 
