@@ -23,6 +23,7 @@
 
 #include "v4l2_backend.h"
 #include "sandbox_heap.h"
+#include "video_stats.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1129,6 +1130,9 @@ static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
                (uint64_t)v.timestamp.tv_usec;
     *out_index = (int)v.index;
     if (v.flags & V4L2_BUF_FLAG_LAST) d->saw_eos = 1;
+    d->cap[v.index].hardware_error = (v.flags & V4L2_BUF_FLAG_ERROR) != 0;
+    if (d->cap[v.index].hardware_error) dmd_video_stats_error(d->video_stats);
+    else dmd_video_stats_hw(d->video_stats);
     return 1;
 }
 

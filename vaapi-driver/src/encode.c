@@ -27,6 +27,7 @@ struct dmd_encode {
     unsigned context_width, context_height;
     struct dmd_enc_config config, opened_config;
     struct dmd_v4l2_encoder *backend;
+    struct dmd_video_stats *video_stats;
     VASurfaceID source, reconstructed, last_reconstructed;
     VABufferID coded;
     int begun, failed, have_sequence, have_picture, have_slice, have_rate_control;
@@ -126,7 +127,15 @@ void dmd_encode_destroy(struct dmd_encode *e)
 {
     if (!e) return;
     dmd_v4l2_enc_close(e->backend);
+    dmd_video_stats_unref(e->video_stats);
     free(e);
+}
+
+void dmd_encode_set_video_stats(struct dmd_encode *e, struct dmd_video_stats *stats)
+{
+    if (!e || e->video_stats == stats) return;
+    dmd_video_stats_unref(e->video_stats);
+    e->video_stats = dmd_video_stats_ref(stats);
 }
 
 void dmd_encode_abort(struct dmd_encode *e)
@@ -646,6 +655,8 @@ VAStatus dmd_encode_end(struct dmd_encode *e, const struct dmd_surface *source,
     if (status != VA_STATUS_SUCCESS) return status;
     if (e->backend && !same_config(&e->config, &e->opened_config))
         return VA_STATUS_ERROR_UNIMPLEMENTED;
+    dmd_video_stats_config(e->video_stats, e->config.width, e->config.height,
+                            e->config.fps_num, e->config.fps_den);
     if (!e->backend) {
         errno = 0;
         int rc = dmd_v4l2_enc_open(&e->backend, &e->config);
@@ -669,6 +680,8 @@ VAStatus dmd_encode_end(struct dmd_encode *e, const struct dmd_surface *source,
                                 e->keyframe, coded->data, coded->size,
                                 &length, &flags);
     int error = rc < -1 ? -rc : errno;
+    if (rc == 0 && length && length <= coded->size)
+        dmd_video_stats_hw(e->video_stats);
     if (sync_fd >= 0) {
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         if (ioctl(sync_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && rc >= 0) {

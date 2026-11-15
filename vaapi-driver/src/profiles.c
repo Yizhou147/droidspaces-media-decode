@@ -67,10 +67,10 @@ static void encode_dimensions(VAProfile profile, unsigned *min_w, unsigned *min_
  * （那句"探针输出 368 = H264|VP8|VP9|HEVC 名实相符"已过时：
  *   VP8 声明已移除，探针位图不再包含 CODEC_HW_VP8。）
  *
- * ⚠️ HEVC 有一类码流无法支持：SPS 里带 st_ref_pic_set 的
- * （num_short_term_ref_pic_sets > 0）。VA-API 只给个数不给内容，
- * 无法复现。那种情况 vaEndPicture 返回 UNIMPLEMENTED 让上层回落软解 ——
- * 见 dmd_hevc_can_build。实测 x265 默认输出 0，常见码流不受影响。
+ * HEVC 的 SPS 参考集可在受支持的 Main 8 位流中，根据 VA DPB/POC
+ * 重建为显式切片内参考集。SPS 长期参考表、自定义缩放表和未知切片
+ * 边界等仍须经过 dmd_hevc_can_build / hevc_slice.c 的限制检查；
+ * 不能把该支持范围扩展解释为 Main10 或任意 HEVC 流均已验证。
  */
 static const VAProfile dmd_profiles[] = {
     VAProfileH264ConstrainedBaseline,

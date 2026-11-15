@@ -68,6 +68,14 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface_id &&
+            (img->handle_acquired || img->mapped)) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
+    }
 
     if (!s->exportable || !s->dumb_handle || s->dumb_drm_fd < 0) {
         /* 分配时回落成普通 heap 了（dumb buffer 不可用）。
@@ -142,6 +150,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         pthread_mutex_unlock(&drv->lock);
         close(prime.fd);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface_id &&
+            (img->handle_acquired || img->mapped)) {
+            pthread_mutex_unlock(&drv->lock);
+            close(prime.fd);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
     }
 
     VADRMPRIMESurfaceDescriptor *desc =

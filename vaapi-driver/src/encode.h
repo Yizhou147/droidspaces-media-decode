@@ -7,6 +7,7 @@
 struct dmd_surface;
 struct dmd_buffer;
 struct dmd_encode;
+struct dmd_video_stats;
 
 /* A synchronous, stateful encoder.  The caller serializes access and keeps
  * source/coded storage alive until end returns.  Sequence parameters persist;
@@ -18,6 +19,7 @@ struct dmd_encode;
 struct dmd_encode *dmd_encode_create(VAProfile profile, unsigned width,
                                       unsigned height, unsigned rate_control);
 void dmd_encode_destroy(struct dmd_encode *enc);
+void dmd_encode_set_video_stats(struct dmd_encode *enc, struct dmd_video_stats *stats);
 /* End a rejected VA transaction which never reached end().  This keeps the
  * sequence/session alive; it cannot repair a backend which failed during IO. */
 void dmd_encode_abort(struct dmd_encode *enc);

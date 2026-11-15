@@ -14,6 +14,7 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <linux/dma-buf.h>
+#include <linux/videodev2.h>
 #include <drm/drm.h>
 #include <drm_fourcc.h>
 #include <stdint.h>
@@ -29,6 +30,7 @@
 #include <va/va_enc_vp9.h>
 
 #include "v4l2_encoder.h"
+#include "v4l2_backend.h"
 
 #define CHECK(expr) do { \
     if (!(expr)) { \
@@ -69,6 +71,8 @@ static int fake_size_mode;
 static unsigned fake_size_stat_calls, fake_size_end_calls, fake_size_set_calls;
 static int fake_export_fd = -1, fake_export_error;
 static unsigned fake_export_flags;
+static int fake_capture_count;
+static unsigned fake_capture_bytes, fake_capture_flags;
 static struct fixture *fake_export_destroy;
 static const uint8_t h264_packet[] = { 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21 };
 static const uint8_t hevc_packet[] = { 0, 0, 0, 1, 0x26, 1, 0x91, 0x80 };
@@ -114,6 +118,17 @@ int ioctl(int fd, unsigned long request, ...)
     va_start(args, request);
     void *arg = va_arg(args, void *);
     va_end(args);
+    if (request == VIDIOC_DQBUF && fake_capture_count) {
+        struct v4l2_buffer *buffer = arg;
+        CHECK(buffer && buffer->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+        buffer->index = 0;
+        buffer->flags = fake_capture_flags;
+        buffer->m.planes[0].bytesused = fake_capture_bytes;
+        buffer->timestamp.tv_sec = 1;
+        buffer->timestamp.tv_usec = 0;
+        fake_capture_count--;
+        return 0;
+    }
     if (request == DRM_IOCTL_PRIME_HANDLE_TO_FD && fake_export_fd >= 0) {
         struct drm_prime_handle *prime = arg;
         CHECK(prime != NULL);
@@ -527,6 +542,46 @@ static void check_packet(struct fixture *f, VABufferID coded, VAProfile profile)
     OK(f->vt.vaUnmapBuffer(&f->va, coded));
 }
 
+static uint64_t stats_number(const char *json, const char *field)
+{
+    char key[128];
+    snprintf(key, sizeof(key), "\"%s\":", field);
+    const char *p = strstr(json, key);
+    CHECK(p);
+    return strtoull(p + strlen(key), NULL, 10);
+}
+
+static int stats_snapshot(VAContextID context, char json[4096])
+{
+    DIR *directory = opendir("/proc/self/fd");
+    CHECK(directory);
+    struct dirent *entry;
+    int found = -1;
+    while ((entry = readdir(directory))) {
+        char path[128], target[256];
+        snprintf(path, sizeof(path), "/proc/self/fd/%.40s", entry->d_name);
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        if (n < 0) continue;
+        target[n] = 0;
+        if (!strstr(target, "/memfd:" DMD_VIDEO_STATS_NAME)) continue;
+        int fd = atoi(entry->d_name);
+        unsigned char header[32];
+        CHECK(pread(fd, header, 32, 0) == 32);
+        CHECK(!memcmp(header, "DMDVID1", 8));
+        uint64_t before, after;
+        uint32_t length;
+        memcpy(&before, header + 16, 8);
+        memcpy(&length, header + 24, 4);
+        CHECK(!(before & 1) && length < 4096 - 32);
+        CHECK(pread(fd, json, length, 32) == length);
+        CHECK(pread(fd, &after, 8, 16) == 8 && before == after);
+        json[length] = 0;
+        if (stats_number(json, "context") == context) { found = fd; break; }
+    }
+    CHECK(closedir(directory) == 0);
+    return found;
+}
+
 static void test_discovery(void)
 {
     struct fixture f;
@@ -599,6 +654,10 @@ static void test_encode_profiles(void)
         struct fixture f;
         init_driver(&f);
         create_encode(&f, profiles[p], 128, 96, p & 1 ? VA_RC_VBR : VA_RC_CBR);
+        char stats[4096];
+        int stats_descriptor = stats_snapshot(f.context, stats);
+        CHECK(stats_descriptor >= 0 && stats_number(stats, "hw_completed") == 0);
+        CHECK(strstr(stats, "\"state\":\"created\""));
         VAImage image = upload_pattern(&f);
         unsigned before_open = fake_open_calls, before_frame = fake_frame_calls;
         for (int key = 1; key >= 0; key--) {
@@ -606,6 +665,11 @@ static void test_encode_profiles(void)
             OK(f.vt.vaBeginPicture(&f.va, f.context, f.surface));
             render_frame(&f, profiles[p], coded, key);
             OK(f.vt.vaEndPicture(&f.va, f.context));
+            CHECK(stats_snapshot(f.context, stats) >= 0);
+            CHECK(stats_number(stats, "hw_completed") == (unsigned)(2 - key));
+            CHECK(stats_number(stats, "output_frames") == (unsigned)(2 - key));
+            CHECK(stats_number(stats, "width") == 128 && stats_number(stats, "height") == 96);
+            CHECK(strstr(stats, "\"target_fps\":29.970029") && stats_number(stats, "errors") == 0);
             check_packet(&f, coded, profiles[p]);
             OK(f.vt.vaSyncSurface(&f.va, f.surface));
             check_pixels(f.width, f.height);
@@ -622,6 +686,7 @@ static void test_encode_profiles(void)
         OK(f.vt.vaDestroyImage(&f.va, image.image_id));
         unsigned before_close = fake_close_calls;
         OK(f.vt.vaDestroyContext(&f.va, f.context));
+        CHECK(fcntl(stats_descriptor, F_GETFD) < 0 && errno == EBADF);
         CHECK(fake_close_calls == before_close + 1);
         OK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1));
         OK(f.vt.vaDestroyConfig(&f.va, f.config));
@@ -670,6 +735,10 @@ static void test_backend_failures(void)
         render_frame(&f, VAProfileH264Main, coded, 1);
         fake_frame_error = errors[i];
         VAStatus status = f.vt.vaEndPicture(&f.va, f.context);
+        char stats[4096];
+        CHECK(stats_snapshot(f.context, stats) >= 0);
+        CHECK(stats_number(stats, "hw_completed") == 0 && stats_number(stats, "output_frames") == 0);
+        CHECK(stats_number(stats, "errors") > 0);
         fake_frame_error = 0;
         CHECK(status == (i == 0 ? VA_STATUS_ERROR_NOT_ENOUGH_BUFFER :
                                   VA_STATUS_ERROR_ENCODING_ERROR));
@@ -813,6 +882,9 @@ static void test_decoded_surface_visible_geometry(void)
         OK(f.vt.vaEndPicture(&f.va, f.context));
         check_packet(&f, coded, VAProfileHEVCMain);
         CHECK(fake_config.width == 128 && fake_config.height == 104);
+        char stats[4096];
+        CHECK(stats_snapshot(f.context, stats) >= 0);
+        CHECK(stats_number(stats, "height") == 104);
         CHECK(fake_stride == original_stride);
         CHECK(fake_slice_height == original_slice_height);
         check_pixels(128, 104);
@@ -918,6 +990,11 @@ static void test_concurrent_destruction(void)
         CHECK(entered && operation_completed_while_blocked);
         CHECK(call.independent_status == VA_STATUS_SUCCESS);
         CHECK(call.destroy_status == VA_STATUS_SUCCESS);
+        char stats[4096];
+        CHECK(stats_snapshot(f.context, stats) >= 0);
+        CHECK(stats_number(stats, "hw_completed") == 1);
+        CHECK(stats_number(stats, "output_frames") == (unsigned)destroy_surface);
+        CHECK(stats_number(stats, "errors") == (unsigned)!destroy_surface);
         check_pixels(f.width, f.height);
         if (destroy_surface) {
             /* The source snapshot belongs to EndPicture, so deleting the
@@ -1188,6 +1265,9 @@ static void test_concurrent_import_destruction(void)
     struct concurrent_call call = { .f = &f, .destroy_surface = 1 };
     OK(f.vt.vaCreateContext(&f.va, f.config, 128, 96, VA_PROGRESSIVE,
                             &f.surface, 1, &call.other_context));
+    /* The independent context may own its own telemetry descriptor. Keep
+     * the import FD lifetime assertions independent of that optional FD. */
+    baseline_fds = fd_count() - input.objects;
     call.coded = make_buffer(&f, VAEncCodedBufferType, 4096, NULL);
     OK(f.vt.vaBeginPicture(&f.va, f.context, f.surface));
     render_frame(&f, VAProfileH264Main, call.coded, 1);
@@ -1325,7 +1405,13 @@ static void test_write_export_encoder_input(void)
         CHECK(s && s->external_write_exported && s->state == DMD_SURFACE_IDLE);
         pthread_mutex_unlock(&drv->lock);
         VAImage image;
-        BAD(f.vt.vaDeriveImage(&f.va, f.surface, &image)); /* export never makes decoded pixels READY */
+        /* VLC probes a fresh pool through DeriveImage. Accessing allocated
+         * storage must not claim that a decode has completed. */
+        OK(f.vt.vaDeriveImage(&f.va, f.surface, &image));
+        pthread_mutex_lock(&drv->lock);
+        CHECK(dmd_find_surface_locked(drv, f.surface)->state == DMD_SURFACE_IDLE);
+        pthread_mutex_unlock(&drv->lock);
+        OK(f.vt.vaDestroyImage(&f.va, image.image_id));
 
         if (!pass) {
             /* A WRITE export must not erase any of the existing readiness,
@@ -1388,6 +1474,122 @@ static void test_write_export_encoder_input(void)
     CHECK(fd_count() == initial_fds);
 }
 
+static void test_legacy_image_prime_interop(void)
+{
+    const unsigned initial_fds = fd_count();
+    struct fixture f;
+    init_driver(&f);
+    create_encode(&f, VAProfileH264Main, 128, 96, VA_RC_CBR);
+    int storage = make_exportable_input(&f);
+    fake_export_fd = storage;
+    VAImage image;
+    OK(f.vt.vaDeriveImage(&f.va, f.surface, &image));
+    struct dmd_driver *drv = dmd_get_driver(&f.va);
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, f.surface);
+    CHECK(s && s->state == DMD_SURFACE_IDLE && s->decode_status == VA_STATUS_SUCCESS);
+    pthread_mutex_unlock(&drv->lock);
+    CHECK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1) == VA_STATUS_ERROR_SURFACE_BUSY);
+
+    VABufferInfo info = { .mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_USER_PTR };
+    CHECK(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &info) ==
+          VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+    fake_export_error = EIO;
+    info = (VABufferInfo){ .mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME };
+    unsigned before = fd_count();
+    BAD(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &info));
+    CHECK(fd_count() == before);
+    fake_export_error = 0;
+    info = (VABufferInfo){ .mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME };
+    OK(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &info));
+    CHECK(info.mem_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME &&
+          info.type == VAImageBufferType && info.mem_size == image.data_size);
+    int exported_fd = (int)info.handle;
+    CHECK(exported_fd >= 0 && fcntl(exported_fd, F_GETFD) >= 0);
+    VABufferInfo second = { .mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME };
+    OK(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &second));
+    CHECK(second.handle == info.handle && fd_count() == before + 1);
+    void *pixels = (void *)1;
+    BAD(f.vt.vaMapBuffer(&f.va, image.buf, &pixels));
+    CHECK(pixels == NULL);
+    BAD(f.vt.vaUnmapBuffer(&f.va, image.buf));
+    CHECK(f.vt.vaDestroyImage(&f.va, image.image_id) == VA_STATUS_ERROR_SURFACE_BUSY);
+    CHECK(f.vt.vaDestroySurfaces(&f.va, &f.surface, 1) == VA_STATUS_ERROR_SURFACE_BUSY);
+    CHECK(f.vt.vaBeginPicture(&f.va, f.context, f.surface) == VA_STATUS_ERROR_SURFACE_BUSY);
+    OK(f.vt.vaReleaseBufferHandle(&f.va, image.buf));
+    CHECK(fcntl(exported_fd, F_GETFD) >= 0);
+    OK(f.vt.vaReleaseBufferHandle(&f.va, image.buf));
+    errno = 0;
+    CHECK(fcntl(exported_fd, F_GETFD) < 0 && errno == EBADF);
+    OK(f.vt.vaReleaseBufferHandle(&f.va, image.buf));
+    fake_sync_mode = 1;
+    OK(f.vt.vaMapBuffer(&f.va, image.buf, &pixels));
+    CHECK(pixels != NULL);
+    CHECK(f.vt.vaDestroyImage(&f.va, image.image_id) == VA_STATUS_ERROR_SURFACE_BUSY);
+    BAD(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &info));
+    CHECK(f.vt.vaBeginPicture(&f.va, f.context, f.surface) == VA_STATUS_ERROR_SURFACE_BUSY);
+    OK(f.vt.vaUnmapBuffer(&f.va, image.buf));
+    fake_sync_mode = 0;
+    OK(f.vt.vaDestroyImage(&f.va, image.image_id));
+
+    /* A client which omits Release/Destroy must not leak the PRIME handle at
+     * Terminate, nor free a borrowed surface allocation twice. */
+    OK(f.vt.vaDeriveImage(&f.va, f.surface, &image));
+    info = (VABufferInfo){ 0 };
+    OK(f.vt.vaAcquireBufferHandle(&f.va, image.buf, &info));
+    exported_fd = (int)info.handle;
+    finish_driver(&f);
+    errno = 0;
+    CHECK(fcntl(exported_fd, F_GETFD) < 0 && errno == EBADF);
+    fake_export_fd = -1;
+    CHECK(close(storage) == 0);
+    CHECK(fd_count() == initial_fds);
+}
+
+static void test_direct_derived_upload(void)
+{
+    struct fixture f;
+    init_driver(&f);
+    create_encode(&f, VAProfileH264Main, 128, 96, VA_RC_CBR);
+    struct dmd_driver *drv = dmd_get_driver(&f.va);
+    VAImage image;
+    OK(f.vt.vaDeriveImage(&f.va, f.surface, &image));
+    uint8_t *pixels;
+    OK(f.vt.vaMapBuffer2(&f.va, image.buf, (void **)&pixels, VA_MAPBUFFER_FLAG_READ));
+    OK(f.vt.vaUnmapBuffer(&f.va, image.buf));
+    pthread_mutex_lock(&drv->lock);
+    CHECK(dmd_find_surface_locked(drv, f.surface)->state == DMD_SURFACE_IDLE);
+    pthread_mutex_unlock(&drv->lock);
+    OK(f.vt.vaMapBuffer2(&f.va, image.buf, (void **)&pixels, VA_MAPBUFFER_FLAG_WRITE));
+    for (unsigned y = 0; y < f.height; y++)
+        for (unsigned x = 0; x < f.width; x++)
+            pixels[image.offsets[0] + y * image.pitches[0] + x] = y_sample(x, y);
+    for (unsigned y = 0; y < f.height / 2; y++)
+        for (unsigned x = 0; x < f.width; x++)
+            pixels[image.offsets[1] + y * image.pitches[1] + x] = uv_sample(x, y);
+    CHECK(f.vt.vaBeginPicture(&f.va, f.context, f.surface) == VA_STATUS_ERROR_SURFACE_BUSY);
+    /* Nested read does not erase a pending write or commit it prematurely. */
+    void *second;
+    OK(f.vt.vaMapBuffer2(&f.va, image.buf, &second, VA_MAPBUFFER_FLAG_READ));
+    CHECK(second == pixels);
+    OK(f.vt.vaUnmapBuffer(&f.va, image.buf));
+    pthread_mutex_lock(&drv->lock);
+    CHECK(dmd_find_surface_locked(drv, f.surface)->state == DMD_SURFACE_IDLE);
+    pthread_mutex_unlock(&drv->lock);
+    OK(f.vt.vaUnmapBuffer(&f.va, image.buf));
+    OK(f.vt.vaDestroyImage(&f.va, image.image_id));
+    pthread_mutex_lock(&drv->lock);
+    CHECK(dmd_find_surface_locked(drv, f.surface)->state == DMD_SURFACE_READY);
+    pthread_mutex_unlock(&drv->lock);
+    VABufferID coded = make_buffer(&f, VAEncCodedBufferType, 4096, NULL);
+    OK(f.vt.vaBeginPicture(&f.va, f.context, f.surface));
+    render_frame(&f, VAProfileH264Main, coded, 1);
+    OK(f.vt.vaEndPicture(&f.va, f.context));
+    check_pixels(f.width, f.height);
+    check_packet(&f, coded, VAProfileH264Main);
+    finish_driver(&f);
+}
+
 static void test_export_destroy_race(void)
 {
     struct fixture f;
@@ -1410,8 +1612,79 @@ static void test_export_destroy_race(void)
     CHECK(close(storage) == 0);
 }
 
+static void test_decode_hardware_telemetry(void)
+{
+    struct dmd_video_stats *stats = dmd_video_stats_create(99, 0, DMD_CODEC_AV1,
+                                                          VAProfileAV1Profile0, "decode mock");
+    CHECK(stats);
+    dmd_video_stats_config(stats, 640, 360, 0, 0);
+    struct dmd_v4l2_dec dec = { .video_stats = stats, .fd = STDIN_FILENO,
+        .cap_ready = 1, .cap_planes = 1, .n_cap = 1 };
+    dec.cap[0].map = fake_pixels;
+    uint8_t *pixels;
+    size_t length;
+    uint64_t pts;
+    int index;
+    char json[4096];
+    for (unsigned frame = 1; frame <= 2; ++frame) {
+        fake_capture_count = 1;
+        fake_capture_bytes = 64;
+        fake_capture_flags = 0;
+        CHECK(dmd_v4l2_recv(&dec, &pixels, &length, &pts, &index, 0) == 1);
+        CHECK(pixels == fake_pixels && length == 64 && index == 0);
+        CHECK(!dec.cap[index].hardware_error);
+        CHECK(stats_snapshot(99, json) >= 0);
+        /* A second AV1 DPB repair output has no surface. Hardware completions
+         * must not be mistaken for two successful VA/presentation frames. */
+        CHECK(stats_number(json, "hw_completed") == frame);
+        CHECK(stats_number(json, "output_frames") == 0);
+    }
+    fake_capture_count = 1;
+    fake_capture_bytes = 0;
+    fake_capture_flags = V4L2_BUF_FLAG_LAST;
+    CHECK(dmd_v4l2_recv(&dec, &pixels, &length, &pts, &index, 0) == 2);
+    CHECK(stats_snapshot(99, json) >= 0 && stats_number(json, "hw_completed") == 2);
+    fake_capture_count = 1;
+    fake_capture_bytes = 64;
+    fake_capture_flags = V4L2_BUF_FLAG_ERROR;
+    CHECK(dmd_v4l2_recv(&dec, &pixels, &length, &pts, &index, 0) == 1);
+    CHECK(dec.cap[index].hardware_error);
+    /* The session carries this slot flag into dmd_frame even if the frame
+     * first waited in send_unit's pending queue. Surface delivery policy must
+     * not count it as success or clear the error state. */
+    dmd_video_stats_decoded(stats, 640, 360, dec.cap[index].hardware_error);
+    CHECK(stats_snapshot(99, json) >= 0);
+    CHECK(stats_number(json, "hw_completed") == 2 && stats_number(json, "errors") == 1);
+    CHECK(stats_number(json, "output_frames") == 0 && strstr(json, "\"state\":\"error\""));
+    dmd_video_stats_reuse(stats);
+    CHECK(stats_snapshot(99, json) >= 0 && stats_number(json, "reused_frames") == 1);
+    CHECK(stats_number(json, "output_frames") == 0 && stats_number(json, "hw_completed") == 2);
+    dmd_video_stats_close(stats);
+    dmd_video_stats_unref(stats);
+}
+
+static void test_telemetry_disabled(void)
+{
+    CHECK(setenv("DMD_VIDEO_STATS", "0", 1) == 0);
+    struct fixture f;
+    init_driver(&f);
+    create_encode(&f, VAProfileH264Main, 128, 96, VA_RC_CBR);
+    VAImage image = upload_pattern(&f);
+    VABufferID coded = make_buffer(&f, VAEncCodedBufferType, 4096, NULL);
+    char stats[4096];
+    CHECK(stats_snapshot(f.context, stats) < 0);
+    OK(f.vt.vaBeginPicture(&f.va, f.context, f.surface));
+    render_frame(&f, VAProfileH264Main, coded, 1);
+    OK(f.vt.vaEndPicture(&f.va, f.context));
+    check_packet(&f, coded, VAProfileH264Main);
+    OK(f.vt.vaDestroyImage(&f.va, image.image_id));
+    finish_driver(&f);
+    CHECK(unsetenv("DMD_VIDEO_STATS") == 0);
+}
+
 int main(void)
 {
+    CHECK(unsetenv("DMD_VIDEO_STATS") == 0);
     test_discovery();
     test_encode_profiles();
     test_upload_geometry();
@@ -1425,7 +1698,11 @@ int main(void)
     test_concurrent_import_destruction();
     test_prime_sync_failure();
     test_write_export_encoder_input();
+    test_legacy_image_prime_interop();
+    test_direct_derived_upload();
     test_export_destroy_race();
+    test_decode_hardware_telemetry();
+    test_telemetry_disabled();
     CHECK(fake_live == 0);
     CHECK(fake_open_calls == fake_close_calls);
     puts("encode VA-API contract tests passed");

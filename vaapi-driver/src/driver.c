@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #include "driver.h"
 #include "encode.h"
@@ -102,6 +105,19 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
         if (!img->in_use)
             continue;
         leaked_img++;
+        if (img->map_sync_started && img->derived_from != VA_INVALID_ID) {
+            struct dmd_surface *parent = dmd_find_surface_locked(drv, img->derived_from);
+            if (parent && parent->dumb_sync_fd >= 0) {
+                struct dma_buf_sync sync = {
+                    .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE
+                };
+                ioctl(parent->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync);
+            }
+        }
+        /* Acquired PRIME descriptors remain driver-owned until Release.
+         * Termination also closes them when a client omits that call. */
+        if (img->handle_acquired && img->acquired_fd >= 0)
+            close(img->acquired_fd);
         /* derive 的 image 借用 surface 缓冲，不能重复 free。 */
         if (img->derived_from == VA_INVALID_ID)
             free(img->data);

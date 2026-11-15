@@ -19,6 +19,7 @@
 #include <va/va_drmcommon.h>
 
 #include "dmd_client.h"
+#include "video_stats.h"
 #include "stubs.h"
 
 #include "av1_bitstream.h"
@@ -273,6 +274,10 @@ struct dmd_image {
     int mapped;
     /* derive 出来的 image 绑定在某个 surface 上；CreateImage 的为 VA_INVALID_ID */
     VASurfaceID derived_from;
+    int acquired_fd;
+    int handle_acquired;
+    unsigned int map_flags;
+    int map_sync_started;
 };
 
 /* 一个 context：config + render target 集合 + 一条 V4L2 解码会话。
@@ -301,6 +306,7 @@ struct dmd_context {
     VAProfile profile;
     VAEntrypoint entrypoint;
     struct dmd_encode *encoder;
+    struct dmd_video_stats *video_stats;
     int codec; /* DMD_CODEC_* */
     unsigned int picture_width;
     unsigned int picture_height;
@@ -548,6 +554,12 @@ struct dmd_context {
 
     VAPictureParameterBufferHEVC hevc_pic_param;
     int hevc_pic_param_valid;
+    /* Long-format slice boundaries. Parameters describe the next data buffer;
+     * offsets below become absolute in slice_data when that buffer arrives. */
+    VASliceParameterBufferHEVC hevc_slice_param[128];
+    size_t hevc_slice_offset[128];
+    unsigned hevc_slice_count, hevc_slices_bound;
+    int hevc_slice_error;
     int have_h264_slice_param;
     VASliceParameterBufferH264 h264_slice_param;
     int have_h264_iq_matrix;

@@ -156,23 +156,6 @@ VAStatus dmd_GetSurfaceAttributes(VADriverContextP dpy, VAConfigID config, VASur
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_AcquireBufferHandle(VADriverContextP ctx, VABufferID buf_id, VABufferInfo *buf_info)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)buf_info;
-    dmd_log("未实现入口被调用: vaAcquireBufferHandle\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id)
-{
-    (void)ctx;
-    (void)buf_id;
-    dmd_log("未实现入口被调用: vaReleaseBufferHandle\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_CreateMFContext(VADriverContextP ctx, VAMFContextID *mfe_context)
 {
     (void)ctx;

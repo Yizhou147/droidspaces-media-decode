@@ -56,9 +56,9 @@ LDLIBS  += -lpthread
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
            $(SRCDIR)/dmd_v4l2_session.c \
           $(SRCDIR)/v4l2_backend.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
-           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c \
+           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/export.c \
            $(SRCDIR)/av1_bitstream.c $(SRCDIR)/mpeg2_bitstream.c \
-           $(SRCDIR)/encode.c $(SRCDIR)/v4l2_encoder.c
+           $(SRCDIR)/encode.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/video_stats.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 DEPS    := $(OBJECTS:.o=.d)
 
@@ -74,6 +74,9 @@ TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
 ENCODE_TESTBIN := $(BUILD)/test_encode_api
 ENCODE_FRONT_TESTBIN := $(BUILD)/test_encode_frontend
 ENCODE_BACK_TESTBIN := $(BUILD)/test_v4l2_encoder
+STATS_TESTBIN := $(BUILD)/test_video_stats
+HEVC_TESTBIN := $(BUILD)/test_hevc_slice
+IMAGE_INTEROP_TESTBIN := $(BUILD)/test_image_interop
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -115,12 +118,15 @@ check: $(BUILD)/$(TARGET)
 
 # 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN)
+tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN)
 	@echo "== 运行单元测试 =="
 	@$(TESTBIN)
 	@$(ENCODE_TESTBIN)
 	@$(ENCODE_FRONT_TESTBIN)
 	@$(ENCODE_BACK_TESTBIN)
+	@$(STATS_TESTBIN)
+	@$(HEVC_TESTBIN)
+	@$(IMAGE_INTEROP_TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
@@ -134,9 +140,20 @@ $(ENCODE_TESTBIN): $(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_enco
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
 		$(TESTDIR)/test_encode_api.c $(filter-out $(SRCDIR)/v4l2_encoder.c,$(SOURCES)) -lpthread -o $@
 
-$(ENCODE_FRONT_TESTBIN): $(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+$(ENCODE_FRONT_TESTBIN): $(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(SRCDIR)/video_stats.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
-		$(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c -lpthread -o $@
+		$(TESTDIR)/test_encode_frontend.c $(SRCDIR)/encode.c $(SRCDIR)/video_stats.c -lpthread -o $@
+
+$(STATS_TESTBIN): $(TESTDIR)/test_video_stats.c $(SRCDIR)/video_stats.c $(SRCDIR)/video_stats.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_video_stats.c $(SRCDIR)/video_stats.c -lpthread -o $@
+
+$(HEVC_TESTBIN): $(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/bitstream.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_hevc_slice.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/bitstream.c -lpthread -o $@
+
+$(IMAGE_INTEROP_TESTBIN): $(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c $(wildcard $(SRCDIR)/*.h) | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) $(DRM_CFLAGS) -I$(SRCDIR) \
+		$(TESTDIR)/test_image_interop.c $(SRCDIR)/image.c -lpthread -o $@
 
 $(ENCODE_BACK_TESTBIN): $(TESTDIR)/test_v4l2_encoder.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/v4l2_encoder.h | $(BUILD)
 	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_v4l2_encoder.c -o $@

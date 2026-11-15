@@ -1,10 +1,6 @@
-/* VAImage 出口：surface 像素回读到 CPU 可访问内存
- *
- * ── 为什么必须走 CPU 路径 ──────────────────────────────────
- * 容器内 ION 完全不可用（legacy EINVAL / modern ENODEV），/dev/dma_heap 不存在
- * （内核 4.14），MediaCodec 的 NDK 公开 API 也拿不到输出缓冲的 dmabuf fd。
- * 所以零拷贝这条路是死的，vaExportSurfaceHandle 保持 UNIMPLEMENTED，
- * 像素一律经普通 heap 内存交付。
+/* VAImage access to the driver's NV12/P010 surface storage.
+ * Storage may be a DRM allocation or a CPU-only fallback. Derived images
+ * borrow that storage; only actual DRM allocations can supply PRIME handles.
  *
  * ── ffmpeg 的实际回读路径（已读 hwcontext_vaapi.c 确证）──────
  * vaapi_frames_init 先建一个测试 surface 调 vaDeriveImage 探测（:696），
@@ -31,10 +27,26 @@
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include <unistd.h>
+#include <drm/drm.h>
 #include <drm_fourcc.h>
 
 #include "driver.h"
+
+/* An acquired handle locks its parent against VA operations; mapped derived
+ * images additionally forbid writes while CPU access is in progress. */
+static int surface_image_busy_locked(struct dmd_driver *drv, VASurfaceID surface,
+                                      int include_mapped)
+{
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface &&
+            (img->handle_acquired || (include_mapped && img->mapped)))
+            return 1;
+    }
+    return 0;
+}
 
 struct dmd_import {
     atomic_uint refs;
@@ -299,6 +311,14 @@ VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_HW_BUSY;
     }
+    if (img->handle_acquired || img->mapped ||
+        img->derived_from == surface ||
+        (img->derived_from != VA_INVALID_ID &&
+         surface_image_busy_locked(drv, img->derived_from, 1)) ||
+        surface_image_busy_locked(drv, surface, 1)) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
     unsigned bpp = s->format == VA_RT_FORMAT_YUV420_10 ? 2 : 1;
     if (img->image.format.fourcc != (bpp == 2 ? VA_FOURCC_P010 : VA_FOURCC_NV12)) {
         pthread_mutex_unlock(&drv->lock);
@@ -457,6 +477,7 @@ static struct dmd_image *image_alloc_locked(struct dmd_driver *drv,
     slot->image.buf = slot->buf_id;
     slot->data = data;
     slot->data_size = desc->data_size;
+    slot->acquired_fd = -1;
     /* backing 非空表示数据属于 surface，DestroyImage 不能 free。 */
     slot->derived_from = VA_INVALID_ID;
 
@@ -534,26 +555,58 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     pthread_mutex_lock(&drv->lock);
-    struct dmd_surface *imported_source = dmd_find_surface_locked(drv, surface);
-    const int imported = imported_source && imported_source->imported;
-    pthread_mutex_unlock(&drv->lock);
-    if (imported)
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-
-    /* 真正的等帧点。SyncSurface 为了不与 MediaCodec 流水线深度死锁，
-     * 对"已提交未就绪"的 surface 直接报成功放行（详见 decode.c 里
-     * dmd_SyncSurface2 的注释）。所以像素必须在这里保证就绪 ——
-     * 下面要读 s->stride / s->slice_height，它们只有帧回来后才是真值。
-     * 必须在取锁之前调用：dmd_surface_wait 自己会加锁。 */
-    VAStatus wait = dmd_surface_wait(drv, surface);
-    if (wait != VA_STATUS_SUCCESS)
-        return wait;
-
-    pthread_mutex_lock(&drv->lock);
     struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
     if (!s) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (s->imported) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    if (surface_image_busy_locked(drv, surface, 0)) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+
+    /* VLC 3's tc_vaegl_get_pool derives a newly allocated surface to test
+     * EGL import before any BeginPicture. libva requires usable initialized
+     * storage, not a decoded frame. Keep IDLE unchanged: this is allocation
+     * access and must never count as a hardware/output completion.
+     * Pending decode, in contrast, must really finish before exposing pixels.
+     * See videolan/vlc 3.0.23 modules/video_output/opengl/converter_vaapi.c
+     * and intel/libva va/va.h vaDeriveImage/vaAcquireBufferHandle. */
+    if (s->state == DMD_SURFACE_PENDING) {
+        pthread_mutex_unlock(&drv->lock);
+        VAStatus wait = dmd_surface_wait(drv, surface);
+        if (wait != VA_STATUS_SUCCESS)
+            return wait;
+        pthread_mutex_lock(&drv->lock);
+        s = dmd_find_surface_locked(drv, surface);
+        if (!s) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        if (s->imported || s->state == DMD_SURFACE_PENDING ||
+            surface_image_busy_locked(drv, surface, 0)) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
+    }
+    if (s->decode_status != VA_STATUS_SUCCESS) {
+        VAStatus status = s->decode_status;
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+    const unsigned sample_bytes = s->format == VA_RT_FORMAT_YUV420_10 ? 2 : 1;
+    if ((s->state != DMD_SURFACE_IDLE && s->state != DMD_SURFACE_READY) ||
+        (s->format != VA_RT_FORMAT_YUV420 && s->format != VA_RT_FORMAT_YUV420_10) ||
+        !s->data || !s->width || !s->height || !s->stride ||
+        s->width > s->stride / sample_bytes || s->height > s->slice_height ||
+        (s->slice_height & 1) ||
+        (uint64_t)s->stride * s->slice_height * 3 / 2 > UINT32_MAX) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
     /* derive 是"直接访问 surface 内存"，所以借用 surface->data，
@@ -590,6 +643,138 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
     return VA_STATUS_SUCCESS;
 }
 
+/* Legacy PRIME export used by VLC 3's allocation probe. This owns a separate
+ * close-on-exec descriptor until the final matching ReleaseBufferHandle;
+ * unlike ExportSurfaceHandle the caller must not close it. Repeated acquire
+ * is reference counted, matching Intel's public media-driver convention.
+ * The ioctl executes with the object lock held so neither the image nor its
+ * DRM allocation can disappear while the handle is being created. */
+VAStatus dmd_AcquireBufferHandle(VADriverContextP ctx, VABufferID buf_id,
+                                  VABufferInfo *buf_info)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv || !buf_info)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (buf_info->mem_type &&
+        !(buf_info->mem_type & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME))
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_image *img = NULL;
+    for (int i = 0; i < DMD_MAX_IMAGES; i++)
+        if (drv->images[i].in_use && drv->images[i].buf_id == buf_id) {
+            img = &drv->images[i];
+            break;
+        }
+    if (!img) {
+        const VAStatus status = dmd_find_buffer_locked(drv, buf_id) ?
+            VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE : VA_STATUS_ERROR_INVALID_BUFFER;
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+    if (img->derived_from == VA_INVALID_ID) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    VASurfaceID parent = img->derived_from;
+    struct dmd_surface *s = dmd_find_surface_locked(drv, parent);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (s->state == DMD_SURFACE_PENDING) {
+        pthread_mutex_unlock(&drv->lock);
+        VAStatus status = dmd_surface_wait(drv, parent);
+        if (status != VA_STATUS_SUCCESS)
+            return status;
+        pthread_mutex_lock(&drv->lock);
+        img = NULL;
+        for (int i = 0; i < DMD_MAX_IMAGES; i++)
+            if (drv->images[i].in_use && drv->images[i].buf_id == buf_id) {
+                img = &drv->images[i];
+                break;
+            }
+        s = dmd_find_surface_locked(drv, parent);
+        if (!img || img->derived_from != parent || !s) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+    }
+    if (s->decode_status != VA_STATUS_SUCCESS) {
+        VAStatus status = s->decode_status;
+        pthread_mutex_unlock(&drv->lock);
+        return status;
+    }
+    if (s->state == DMD_SURFACE_PENDING || img->mapped) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    if (s->state != DMD_SURFACE_IDLE && s->state != DMD_SURFACE_READY) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    if (!s->exportable || s->imported || !s->dumb_handle ||
+        s->dumb_drm_fd < 0 || img->data != s->data ||
+        img->data_size > s->dumb_size || img->data_size > s->data_size ||
+        img->image.pitches[0] != s->stride ||
+        img->image.offsets[1] != (uint64_t)s->stride * s->slice_height) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    if (img->handle_acquired == INT_MAX) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+    if (!img->handle_acquired) {
+        if (surface_image_busy_locked(drv, parent, 1)) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
+        struct drm_prime_handle prime = {
+            .handle = s->dumb_handle, .flags = DRM_CLOEXEC | DRM_RDWR, .fd = -1
+        };
+        if (ioctl(s->dumb_drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0 ||
+            prime.fd < 0) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        img->acquired_fd = prime.fd;
+    }
+    img->handle_acquired++;
+    memset(buf_info, 0, sizeof(*buf_info));
+    buf_info->handle = (uintptr_t)img->acquired_fd;
+    buf_info->type = VAImageBufferType;
+    buf_info->mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    buf_info->mem_size = s->dumb_size;
+    pthread_mutex_unlock(&drv->lock);
+    dmd_log("AcquireBufferHandle: image buffer=%u PRIME fd=%d\n",
+            (unsigned)buf_id, (int)buf_info->handle);
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    pthread_mutex_lock(&drv->lock);
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        struct dmd_image *img = &drv->images[i];
+        if (!img->in_use || img->buf_id != buf_id)
+            continue;
+        if (img->handle_acquired && --img->handle_acquired == 0) {
+            close(img->acquired_fd);
+            img->acquired_fd = -1;
+        }
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
+    VAStatus status = dmd_find_buffer_locked(drv, buf_id) ?
+        VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE : VA_STATUS_ERROR_INVALID_BUFFER;
+    pthread_mutex_unlock(&drv->lock);
+    return status;
+}
+
 VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
@@ -602,6 +787,10 @@ VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
     if (!img) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+    if (img->mapped || img->handle_acquired) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
     }
     /* derive 出来的 image 借用 surface 缓冲，绝不能 free。 */
     unsigned char *owned =
@@ -712,6 +901,17 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
+    /* A different derived image may own the same parent allocation. Check
+     * both operands: copying through an inactive alias must not bypass an
+     * acquired handle or CPU map of that parent. */
+    if (img->mapped || img->handle_acquired || img->derived_from == surface ||
+        (img->derived_from != VA_INVALID_ID &&
+         surface_image_busy_locked(drv, img->derived_from, 1)) ||
+        surface_image_busy_locked(drv, surface, 0)) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+
     /* surface 还没解出来就 GetImage：按 VA-API 语义隐式同步。
      * ffmpeg 会先 vaSyncSurface，但别的消费者未必。 */
     if (s->state == DMD_SURFACE_PENDING) {
@@ -727,6 +927,13 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         if (!s || !img) {
             pthread_mutex_unlock(&drv->lock);
             return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        if (img->mapped || img->handle_acquired || img->derived_from == surface ||
+            (img->derived_from != VA_INVALID_ID &&
+             surface_image_busy_locked(drv, img->derived_from, 1)) ||
+            surface_image_busy_locked(drv, surface, 0)) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
         }
     }
 
@@ -771,12 +978,6 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     if (width > img->image.width || height > img->image.height) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
-
-    /* derive 出来的 image 直接指向 surface 内存，同一 surface 时无需拷贝。 */
-    if (img->derived_from == surface) {
-        pthread_mutex_unlock(&drv->lock);
-        return VA_STATUS_SUCCESS;
     }
 
     unsigned int copy_w = width, copy_h = height;
