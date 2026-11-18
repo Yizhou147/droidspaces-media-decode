@@ -458,17 +458,17 @@ static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
      * 纯绿；后续 781 次导出全部正常（UV 均值约 123.6）。
      *
      * 10bit(P010) 不能沿用同一个 memset：样本是 16-bit 小端，整字节填 0x80
-     * 得到的是 0x8080=32896，远超 10bit 量程。中性 128 的字节序列是
-     * 0x80 0x00，必须逐样本写。Y 平面（黑=0）两种位深一致。 */
+     * 会得到不精确的 0x8080。P010 中性是 512<<6=0x8000，
+     * 小端字节为 0x00 0x80。Y 平面（黑=0）两种位深一致。 */
     memset(map, 0, (size_t)stride * bh);                    /* Y 平面：黑 */
     {
         unsigned char *uv = (unsigned char *)map + (size_t)stride * bh;
         size_t uv_bytes = creq.size - (size_t)stride * bh;
         if (sample_bytes == 2) {
-            /* P010：U/V 各 16bit 小端，中性 128 = {0x80, 0x00} 交替 */
+            /* P010: neutral chroma 512 occupies the high ten bits. */
             for (size_t k = 0; k + 1 < uv_bytes; k += 2) {
-                uv[k] = 0x80;
-                uv[k + 1] = 0x00;
+                uv[k] = 0x00;
+                uv[k + 1] = 0x80;
             }
         } else {
             memset(uv, 0x80, uv_bytes);                    /* NV12：无色偏 */
@@ -618,7 +618,11 @@ static VAStatus create_surfaces_common(VADriverContextP ctx,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (num_surfaces == 0)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    if (width < DMD_MIN_WIDTH || height < DMD_MIN_HEIGHT ||
+    /* Surfaces are also standalone images: mpv tests upload/export with a
+     * real 16x16 NV12/P010 surface before accepting decoder frames. The codec
+     * minimum belongs to CreateContext, which still enforces DMD_MIN_*.
+     * Keep the storage limit and require complete 4:2:0 chroma samples. */
+    if (!width || !height || ((width | height) & 1) ||
         width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
     /* 8-bit NV12 与 10-bit P010。谎报会让消费者选中我们然后拿到花屏，
@@ -933,7 +937,7 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     int codec = c->codec;
     unsigned int w = c->picture_width;
     unsigned int h = c->picture_height;
-    int ten_bit = c->av1_bd_reported == 2;
+    int ten_bit = c->output_ten_bit;
 
     /* 摘下旧会话 + 置 retiring。只摘指针挡不住收帧线程：它可能在摘之前就把
      * sess 抓在手里、正放锁做 IO。旧代码在这里直接 io_busy=1（不检查现值）
@@ -1079,6 +1083,7 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     c->id = (VAContextID)(drv->next_context_id++);
     c->config_id = config_id;
     c->profile = profile;
+    c->output_ten_bit = profile == VAProfileHEVCMain10;
     c->entrypoint = cfg->entrypoint;
     c->codec = codec;
     c->picture_width = (unsigned int)picture_width;
@@ -1110,12 +1115,13 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
 
     /* 会话建立在放锁后做 —— connect + 握手是阻塞 IO，持锁做会卡住
      * 其他线程的所有对象操作。 */
-    /* 位深在这里还未知（首个 PPB 才带来），传 0。
-     * CAPTURE 协商发生在第一个单元送出的 SOURCE_CHANGE 里，
-     * dmd_session_set_ten_bit() 敢在那之前写入。 */
+    /* Main10 tentatively starts with P010; its first valid PPB and actual
+     * target select NV12/P010 before any parameter-set unit is sent. Config
+     * RTFormat and an optional mixed render-target pool do not fix that choice.
+     * AV1 still supplies its 8/10-bit depth in its PPB. */
     struct dmd_session *sess =
         session_open(codec, (unsigned int)picture_width,
-                     (unsigned int)picture_height, 0);
+                     (unsigned int)picture_height, profile == VAProfileHEVCMain10);
 
     pthread_mutex_lock(&drv->lock);
     /* 重新查找：理论上没人能销毁一个还没交给调用方的 context，
@@ -2140,8 +2146,40 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                        b->size >= sizeof(VAPictureParameterBufferHEVC)) {
                 /* 用途同 H.264：合成 VPS/SPS/PPS，并取 POC 供配对回退路径用。
                  * CurrPic.pic_order_cnt 是已解包的完整 POC，可直接比大小。 */
-                memcpy(&c->hevc_pic_param, b->data,
-                       sizeof(VAPictureParameterBufferHEVC));
+                const VAPictureParameterBufferHEVC *pp = (const VAPictureParameterBufferHEVC *)b->data;
+                const unsigned minus8 = pp->bit_depth_luma_minus8;
+                const int ten_bit = minus8 == 2;
+                struct dmd_surface *target = dmd_find_surface_locked(drv, c->current_target);
+                /* Main10 genuinely accepts 8-bit NV12 and 10-bit P010. Lock
+                 * depth on the first valid PPB, before CAPTURE negotiation;
+                 * retain that lock across subsequent frames/session rebuilds.
+                 * Main remains 8-bit, and no sample-size conversion is done. */
+                if ((minus8 != 0 && minus8 != 2) ||
+                    pp->bit_depth_chroma_minus8 != minus8 ||
+                    (c->profile != VAProfileHEVCMain10 && ten_bit) ||
+                    (c->hevc_pic_param_valid && ten_bit != c->output_ten_bit) ||
+                    pp->pic_fields.bits.chroma_format_idc != 1 ||
+                    pp->pic_fields.bits.separate_colour_plane_flag ||
+                    !target || target->format != (ten_bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420)) {
+                    dmd_log("HEVC: unsupported depth/chroma or target format "
+                            "profile=%d luma=%u chroma=%u surface=%d\n",
+                            (int)c->profile, (unsigned)pp->bit_depth_luma_minus8,
+                            (unsigned)pp->bit_depth_chroma_minus8,
+                            target ? (target->format == VA_RT_FORMAT_YUV420_10) : -1);
+                    dmd_video_stats_error(c->video_stats);
+                    if (target) {
+                        target->state = DMD_SURFACE_IDLE;
+                        target->decode_status = VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+                    }
+                    c->current_target = VA_INVALID_ID;
+                    pthread_mutex_unlock(&drv->lock);
+                    return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+                }
+                if (!c->hevc_pic_param_valid) {
+                    c->output_ten_bit = ten_bit;
+                    dmd_session_set_ten_bit(c->session, ten_bit);
+                }
+                memcpy(&c->hevc_pic_param, pp, sizeof(*pp));
                 c->hevc_pic_param_valid = 1;
                 {
                     static int logged;
@@ -2436,7 +2474,8 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 协商在首个单元送出的 SOURCE_CHANGE 里，必须赶在那之前写入。 */
         if (!c->av1_bd_reported) {
             c->av1_bd_reported = pp->bit_depth_idx != 0 ? 2 : 1;
-            dmd_session_set_ten_bit(c->session, c->av1_bd_reported == 2);
+            c->output_ten_bit = c->av1_bd_reported == 2;
+            dmd_session_set_ten_bit(c->session, c->output_ten_bit);
         }
 
         av1_record_pic(pp);
@@ -3448,8 +3487,8 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context)
          * 建会话前同样要先取得 IO 所有权：本槽位若被别人占着，我们盲置
          * io_busy 再交还，等于把对方的所有权抹掉。
          * 另外 ten_bit 必须在放锁**之前**读好 —— 原来是在放锁之后读
-         * `c->av1_bd_reported`，那个 c 可能已经换人了。 */
-        const int retry_ten_bit = c->av1_bd_reported == 2;
+         * `c->output_ten_bit`，那个 c 可能已经换人了。 */
+        const int retry_ten_bit = c->output_ten_bit;
         if (io_acquire(drv, idx, "EndPicture/建会话") < 0) {
             struct dmd_surface *s = dmd_find_surface_locked(drv, target);
             if (s) {
@@ -4810,8 +4849,17 @@ static void store_clipped_locked(struct dmd_surface *s, const struct dmd_frame *
     const unsigned char *suv = f->data + plane;
     for (unsigned int r = 0; r < rows / 2; r++)
         memcpy(duv + (size_t)r * s->stride, suv + (size_t)r * src_stride, cols);
-    for (unsigned int r = rows / 2; r < s->slice_height / 2; r++)
-        memset(duv + (size_t)r * s->stride, 128, s->stride); /* UV 中性是 128 不是 0 */
+    for (unsigned int r = rows / 2; r < s->slice_height / 2; r++) {
+        unsigned char *line = duv + (size_t)r * s->stride;
+        if (s->format == VA_RT_FORMAT_YUV420_10) {
+            for (unsigned int k = 0; k + 1 < s->stride; k += 2) {
+                line[k] = 0;
+                line[k + 1] = 0x80;
+            }
+        } else {
+            memset(line, 128, s->stride);
+        }
+    }
 
     dumb_sync_end_write(s);
 }

@@ -840,6 +840,22 @@ static void nv12_copy(unsigned char *dst, unsigned int dst_stride,
     }
 }
 
+/* P010 stores each 10-bit sample in the high bits of a little-endian word.
+ * Neutral chroma is 512 << 6 = 0x8000; byte memset(128) gives 0x8080 and
+ * writes nonzero padding bits. NV12 keeps its existing single-byte neutral. */
+static void fill_chroma_neutral(unsigned char *dst, size_t bytes,
+                                 unsigned int sample_bytes)
+{
+    if (sample_bytes == 1) {
+        memset(dst, 128, bytes);
+        return;
+    }
+    for (size_t offset = 0; offset + 1 < bytes; offset += 2) {
+        dst[offset] = 0;
+        dst[offset + 1] = 0x80;
+    }
+}
+
 VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
                       unsigned int width, unsigned int height, VAImageID image)
 {
@@ -1016,11 +1032,11 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
             memset(img->data + ((size_t)y + r) * dp + (size_t)x * spb, 0,
                    (size_t)width * spb);
         for (unsigned int r = 0; r < copy_h / 2; r++)
-            memset(duv + ((size_t)y / 2 + r) * dp + ((size_t)x + copy_w) * spb,
-                   128, tail);
+            fill_chroma_neutral(duv + ((size_t)y / 2 + r) * dp +
+                                ((size_t)x + copy_w) * spb, tail, spb);
         for (unsigned int r = copy_h / 2; r < height / 2; r++)
-            memset(duv + ((size_t)y / 2 + r) * dp + (size_t)x * spb, 128,
-                   (size_t)width * spb);
+            fill_chroma_neutral(duv + ((size_t)y / 2 + r) * dp + (size_t)x * spb,
+                                (size_t)width * spb, spb);
     }
 
     pthread_mutex_unlock(&drv->lock);

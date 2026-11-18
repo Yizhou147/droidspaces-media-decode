@@ -143,8 +143,10 @@ int dmd_hevc_rewrite_slice(const VAPictureParameterBufferHEVC *p,
         s->slice_data_flag != VA_SLICE_DATA_FLAG_ALL) { errno = EINVAL; return -1; }
     if (!p->num_short_term_ref_pic_sets || p->num_short_term_ref_pic_sets > 64 ||
         p->num_long_term_ref_pic_sps || p->pic_fields.bits.chroma_format_idc != 1 ||
-        p->pic_fields.bits.separate_colour_plane_flag || p->bit_depth_luma_minus8 ||
-        p->bit_depth_chroma_minus8 || p->pic_fields.bits.scaling_list_enabled_flag ||
+        p->pic_fields.bits.separate_colour_plane_flag ||
+        p->bit_depth_luma_minus8 != p->bit_depth_chroma_minus8 ||
+        (p->bit_depth_luma_minus8 != 0 && p->bit_depth_luma_minus8 != 2) ||
+        p->pic_fields.bits.scaling_list_enabled_flag ||
         (p->CurrPic.flags & (VA_PICTURE_HEVC_FIELD_PIC | VA_PICTURE_HEVC_BOTTOM_FIELD)) ||
         p->log2_max_pic_order_cnt_lsb_minus4 > 12) { errno = ENOTSUP; return -1; }
     unsigned type = (input[0] >> 1) & 63;
@@ -189,6 +191,9 @@ int dmd_hevc_rewrite_slice(const VAPictureParameterBufferHEVC *p,
     if (dependent != s->LongSliceFlags.fields.dependent_slice_segment_flag) {
         errno = EBADMSG; goto done;
     }
+    /* Main and Main10 use the same syntax up through the ST-RPS. Bit-depth
+     * dependent weights/QP and all CABAC data lie in the unchanged suffix;
+     * never reinterpret or reduce those fields to an 8-bit representation. */
     size_t begin = 0, end = 0;
     struct reference refs[15];
     unsigned negative = 0, positive = 0;
